@@ -1,0 +1,19 @@
+{
+  "name": "动物分析，报告撰写全工作流",
+  "id": "full_animal_workflow",
+  "description": "完整流程：分析+审核+报告",
+  "type": "workflow",
+  "parameters": {
+    "work_dir": "工作目录路径，包含输入和输出文件",
+    "input_file": "样线表文件名，如：样线表.xlsx",
+    "history_file": "历史资料文件名，如：历史资料.xlsx",
+    "pa": "居留型起始标记（可选，默认 ⅤA）",
+    "regional_level": "省级保护级别（可选）"
+  },
+  "workflow_steps": [
+    {"step": 1, "type": "skill", "use_skill": "动物列表合并", "review_point": false},
+    {"step": 2, "type": "skill", "use_skill": "动物名录生成", "review_point": false, "input_from": 1},
+    {"step": 3, "type": "review", "review_point": true, "description": "动物名录生成 结果"},
+    {"step": 4, "type": "skill", "use_skill": "alpha多样性分析", "review_point": false, "input_from": 2}
+      ]
+}

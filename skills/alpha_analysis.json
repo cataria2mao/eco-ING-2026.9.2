@@ -1,0 +1,22 @@
+{
+  "name": "alpha多样性分析",
+  "id": "alpha_diversity_analysis",
+  "description": "基于样线表的，α物种多样性分析",
+  "type": "single",
+  "parameters": {
+    "work_dir": "工作目录路径（必填）",
+    "input_file": "动物样线表（必填），如：样线表.xlsx"
+  },
+  "workflow": [
+    {
+      "tool": "run_r",
+      "params": {
+        "script_path": "skills/alpha_analysis.R",
+        "script_args": [
+          "--work_dir", "{work_dir}",
+          "--input_file", "{input_file}"
+        ]
+      }
+    }
+  ]
+}

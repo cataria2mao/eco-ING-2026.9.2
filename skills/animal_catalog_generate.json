@@ -1,0 +1,30 @@
+{
+  "name": "动物名录生成",
+  "id": "animal_catalog_generate",
+  "description": "对陆生动物物种数据初步整理，输出物种名录。",
+  "type": "single",
+  "parameters": {
+    "work_dir": "工作目录（必填）",
+    "input_file": "待处理的 Excel 文件名（必填）",
+    "ref_file": "参考名录文件路径（可选）",
+    "pa": "居留型起始标记（必填）",
+    "regional_level": "省级保护级别（必填）"
+  },
+  "workflow": [
+    {
+      "step": 1,
+      "tool": "run_python",
+      "params": {
+        "script_path": "skills/animal_excel_catalog_generate.py",
+        "script_args": [
+          "--work_dir", "{work_dir}",
+          "--input_file", "{input_file}",
+          "--ref_file", "{ref_file}",
+          "--pa", "{pa}",
+          "--regional_level", "{regional_level}"
+        ]
+      }
+    }
+  ]
+}
+

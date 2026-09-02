@@ -1,0 +1,35 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+dist/
+build/
+
+# ===== 环境变量 / 密钥 =====
+.env
+
+# ===== 向量库 / 运行时产物 =====
+chroma_sop_db/
+
+# ===== 日志 / 临时文件 =====
+*.log
+日志.docx
+日志.md
+~$*.docx
+*.tmp
+history_checkpoints.txt
+
+# ===== 业务数据（请勿开源）=====
+skills/参考名录.xlsx
+*.xlsx
+*.RData
+*.Rhistory
+Rplots.pdf
+
+# ===== IDE =====
+.idea/
+.vscode/
+.langgraph_api/

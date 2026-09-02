@@ -1,0 +1,24 @@
+{
+  "name": "动物名录分析",
+  "id": "animal_catalog_analysis",
+  "description": "对动物名录（excel）分析，包括目科种，区系，居留型等",
+  "type": "single",
+  "parameters": {
+    "work_dir": "工作目录路径（必填）",
+    "input_file": "动物名录文件名（必填），如：动物名录.xlsx",
+    "regional_level": "省级保护级别（必填），如：江苏省级"
+  },
+  "workflow": [
+    {
+      "tool": "run_r",
+      "params": {
+        "script_path": "skills/animal_catalog_analysis.R",
+        "script_args": [
+          "--work_dir", "{work_dir}",
+          "--input_file", "{input_file}",
+          "--regional_level", "{province}"
+        ]
+      }
+    }
+  ]
+}

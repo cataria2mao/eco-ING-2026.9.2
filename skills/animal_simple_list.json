@@ -1,0 +1,27 @@
+{
+  "name": "动物列表合并",
+  "id": "animal_simple_list",
+  "description": "合并样线表和历史资料中的动物中文名列表，去重并优先保留样线表数据（现场调查）",
+  "type": "single",
+  "parameters": {
+    "work_dir": "工作目录路径，包含输入和输出文件",
+    "input_file": "样线表文件名，如：样线表.xlsx",
+    "history_file": "历史资料文件名，如：历史资料.xlsx",
+    "output_file": "输出文件名，如：动物列表.xlsx"
+  },
+  "workflow": [
+    {
+      "step": 1,
+      "tool": "run_python",
+      "params": {
+        "script_path": "skills/animal_simple_list.py",
+        "script_args": [
+          "--work_dir", "{work_dir}",
+          "--input_file", "{input_file}",
+          "--history_file", "{history_file}",
+          "--output_file", "{output_file}"
+        ]
+      }
+    }
+  ]
+}
