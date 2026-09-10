@@ -1,8 +1,12 @@
 import os, json
 from pathlib import Path
 import chromadb
-from langchain_docling.loader import DoclingLoader
+from docx import Document
+from typing import List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
 
 SOP_DOCX_PATH = os.getenv("SOP_DOCX_PATH", r"D:\PythonProject1\生态环境调查报告工作.docx")
 CHROMA_DIR = os.getenv("CHROMA_DIR", str(Path(__file__).resolve().parent / "chroma_sop_db"))
@@ -49,15 +53,47 @@ class DashScopeEmbeddingFunction:
         return "dashscope_text_embedding_v3"
 
 
-def read_sop_chunks():
-    loader = DoclingLoader(SOP_DOCX_PATH)
-    documents = loader.load()
-    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+def read_sop_chunks() -> List[str]:
+    """读取 SOP docx，按段落+表格抽取文本，再切块。"""
+    if not os.path.exists(SOP_DOCX_PATH):
+        print(f"[VEC] SOP 文件不存在: {SOP_DOCX_PATH}")
+        return []
+
+    try:
+        doc = Document(SOP_DOCX_PATH)
+    except Exception as e:
+        print(f"[VEC] 打开 SOP docx 失败: {e}")
+        return []
+
+    lines: List[str] = []
+
+    # 1) 普通段落
+    for p in doc.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            lines.append(t)
+
+    # 2) 表格（SOP 里常有关键表格，别漏掉）
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [(c.text or "").strip() for c in row.cells]
+            if any(cells):
+                lines.append(" | ".join(cells))
+
+    full_text = "\n".join(lines)
+    if not full_text.strip():
+        print("[VEC] SOP 文档解析后为空，请检查文件内容")
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=50,
+        separators=["\n\n", "\n", "。", "；", "，", " ", ""],
+        length_function=len,   # 不依赖 tiktoken
     )
-    doc_chunks = splitter.split_documents(documents)
-    return [d.page_content for d in doc_chunks]
+    chunks = splitter.split_text(full_text)
+    print(f"[VEC] SOP 读取完成：{len(lines)} 段 → {len(chunks)} 个文本块")
+    return chunks
 
 
 def main():
