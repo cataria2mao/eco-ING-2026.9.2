@@ -1,7 +1,0 @@
-{
-  "dependencies": ["."],
-  "graphs": {
-    "my_agent": "./ces.py:agent"
-  },
-  "env": ".env"
-}
