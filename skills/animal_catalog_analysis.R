@@ -7,6 +7,7 @@ library(scales)
 library(ggplot2)
 library(optparse)
 library(rvg)
+library(fs, warn.conflicts = FALSE)
 
 windowsFonts(SimSun=windowsFont("SimSun"))
 
@@ -15,13 +16,13 @@ args <- commandArgs(trailingOnly = TRUE)
 
 option_list <- list(
   make_option(c("-o", "--work_dir"), type="character", default="D:/EcoAgentProject/广西风电鸟类监测"),
-  make_option(c("-i", "--input_file"),  type="character", default="step1_result.xlsx"),
+  make_option(c("-i", "--input_file"),  type="character", default="D:/EcoAgentProject/广西风电鸟类监测/动物名录.xlsx"),
   make_option(c("-r", "--regional_level"), type="character", default="广西自治区级")
 )
 opt <- parse_args(OptionParser(option_list=option_list))
 
 work_dir <- opt$work_dir
-input_folder <- file.path(work_dir, opt$input_file)
+input_folder <- path_abs(opt$input_file, start = work_dir)
 sj  <- opt$regional_level
 
 if (!dir.exists(work_dir)) {

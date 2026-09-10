@@ -5,7 +5,8 @@
   "type": "single",
   "parameters": {
     "work_dir": "工作目录路径（必填）",
-    "input_file": "动物样线表（必填），如：样线表.xlsx"
+    "input_file": "动物样线表（必填），如：样线表.xlsx",
+    "groups_type": "分组依据（必填），可选”无“，”季节“，”地区“"
   },
   "workflow": [
     {
@@ -14,7 +15,8 @@
         "script_path": "skills/alpha_analysis.R",
         "script_args": [
           "--work_dir", "{work_dir}",
-          "--input_file", "{input_file}"
+          "--input_file", "{input_file}",
+          "--groups_type", "{groups_type}"
         ]
       }
     }

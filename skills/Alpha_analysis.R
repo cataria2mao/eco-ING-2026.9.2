@@ -8,6 +8,7 @@ library(export)
 library(vegan)
 library(optparse)
 library(rvg)
+library(fs, warn.conflicts = FALSE)
 
 
 windowsFonts(SimSun=windowsFont("SimSun"))
@@ -23,14 +24,14 @@ args <- commandArgs(trailingOnly = TRUE)
 
 option_list <- list(
   make_option(c("-o", "--work_dir"), type="character", default="D:/EcoAgentProject/广西风电鸟类监测"),
-  make_option(c("-i", "--input_file"),  type="character", default="广西风电样线表.xlsx"),
+  make_option(c("-i", "--input_file"),  type="character", default="D:/EcoAgentProject/广西风电鸟类监测/广西风电样线表.xlsx"),
   make_option(c("-g", "--groups_type"),  type="character", default="无")
 )
 
 opt <- parse_args(OptionParser(option_list=option_list))
 
 work_dir <- opt$work_dir
-input_folder <- file.path(work_dir, opt$input_file)
+input_folder <- path_abs(opt$input_file, start = work_dir)
 groups_type <- opt$groups_type
 
 
@@ -69,7 +70,7 @@ if (groups_type == "季节") {
   
   # 设置季节顺序（可选，按自然顺序排列）
   df_long$jijie <- factor(df_long$jijie, levels = c("春季", "夏季", "秋季", "冬季"))
-  df$jijie <- droplevels(df$jijie)
+  df$jijie <- droplevels(df$季节)
   
   
   # 分面图
@@ -141,7 +142,7 @@ if (groups_type == "季节") {
   
   dyxD$Simpson.D <- diversity(df$nums, index = "simpson")
   dyxD$Shannon.H <- diversity(df$nums, index = "shannon")
-  dyxD$Pielou.E <- diversity(df$nums, index = "shannon")/log(specnumber(vec))
+  dyxD$Pielou.E <- diversity(df$nums, index = "shannon")/log(specnumber(df$nums))
   dyxD$DM <- Margalef.DM(df$nums)
 
 }

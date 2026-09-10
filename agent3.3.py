@@ -1,4 +1,9 @@
-import os, json, subprocess, re, sys, math
+import os
+import json
+import subprocess
+import re
+import sys
+import math
 from datetime import datetime
 from docx import Document
 from pathlib import Path
@@ -19,7 +24,16 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 # ========== 状态定义 ==========
-class AgentState(TypedDict):
+# 子图与父图状态分离：
+#   子图（animal_date_analysis_agent / plant_date_analysis_agent）只持有执行层字段；
+#   父图在继承子图字段的基础上，追加协调层（检索/规划/分发）专用字段。
+#
+# 两个子图共用同一套执行状态结构（AnalysisState），但各自独立编译、独立 checkpoint
+# 命名空间；父图通过 domain + 命名空间结果字段（animal_result / plant_result）区分结果，互不干扰。
+
+
+class AnalysisState(TypedDict):
+    """子图执行状态（动物子图与植物子图共用）。"""
     # 对话
     messages: Annotated[list, add_messages]
 
@@ -57,13 +71,20 @@ class AgentState(TypedDict):
     final_output: Optional[Any]
     error: Optional[str]
 
-    # 父图额外字段（子图会忽略）
+    # 领域: "animal" | "plant"
+    domain: Optional[str]
+
+
+class ParentState(AnalysisState):
+    """父图状态：在子图状态之上追加协调层字段（检索、规划、分发、结果隔离）。"""
     retrieved_docs: Optional[List[str]]
-    plan: Optional[str]
     parent_plan: Optional[Dict]
     parent_action: Optional[str]
     parent_skill_registry: Optional[List[Dict]]
     subgraph_delegated: Optional[bool]
+    # 两个子图的结果分别落位，互不覆盖
+    animal_result: Optional[Dict]
+    plant_result: Optional[Dict]
 
 
 # ========== model ==========
@@ -80,7 +101,7 @@ llm = ChatDeepSeek(
 
 # ========== skills ==========
 def discover_skills(skills_root: Path) -> List[Dict[str, Any]]:
-    """扫描 skills/*.json，提取 name, description 和 json 路径"""
+    """扫描 skills_root/*.json，提取 name, description 和 json 路径"""
     skills = []
     if not skills_root.exists():
         return skills
@@ -100,17 +121,16 @@ def discover_skills(skills_root: Path) -> List[Dict[str, Any]]:
     return skills
 
 
-def _load_full_skill(skill_name: str) -> tuple:
-    """加载技能的完整配置"""
-    global skill_registry
+def _load_full_skill_from(registry: List[Dict], skill_name: str) -> tuple:
+    """从指定技能注册表加载技能的完整配置"""
     skill_basic = None
-    for s in skill_registry:
+    for s in registry:
         if s["name"] == skill_name or s.get("id") == skill_name:
             skill_basic = s
             break
 
     if not skill_basic:
-        available = [s["name"] for s in skill_registry]
+        available = [s["name"] for s in registry]
         return None, f"错误：未找到技能 '{skill_name}'，可用：{', '.join(available)}"
 
     json_path = skill_basic["_json_path"]
@@ -123,20 +143,35 @@ def _load_full_skill(skill_name: str) -> tuple:
     return full_skill, json_path
 
 
-SKILLS_ROOT = Path("./skills")
-skill_registry = discover_skills(SKILLS_ROOT)
+# 两子图技能分别放在不同文件夹下，各自独立发现、互不干扰
+ANIMAL_SKILLS_ROOT = Path("./skills")
+PLANT_SKILLS_ROOT = Path("./skills/plant")
+
+animal_skill_registry = discover_skills(ANIMAL_SKILLS_ROOT)
+plant_skill_registry = discover_skills(PLANT_SKILLS_ROOT)
+
+DOMAIN_REGISTRY = {
+    "animal": animal_skill_registry,
+    "plant": plant_skill_registry,
+}
+
+
+def _registry_for_domain(domain: Optional[str]) -> List[Dict]:
+    if domain == "plant":
+        return plant_skill_registry
+    return animal_skill_registry
 
 
 # ========== system prompt ==========
-def _build_system_prompt() -> str:
+def _build_system_prompt(registry: List[Dict], role: str, task_desc: str) -> str:
     skill_list = ""
-    if skill_registry:
-        for skill in skill_registry:
+    if registry:
+        for skill in registry:
             skill_list += f"  - {skill['name']}（id: {skill['id']}）: {skill['description']}\n"
     else:
         skill_list = "  （暂无技能）\n"
 
-    prompt = f"""你是一个野生动物调查数据分析助手，帮助用户执行数据分析技能和文件操作。
+    prompt = f"""你是一个{role}，帮助用户执行{task_desc}。
 
     技能执行流程
     当用户要求执行某个技能时，你必须严格按以下步骤操作：
@@ -147,21 +182,30 @@ def _build_system_prompt() -> str:
     5. 所有参数确认后，调用 launch_skill 启动执行
 
     严禁事项
-    绝对不能编造、模拟或推测脚本的执行结果
+    绝对不能编造、推测或模拟脚本的执行结果
     执行结果由系统消息告诉你，你不可以自己判断执行是否成功
 
     当前可用技能
-    {skill_list} 
+    {skill_list}
 
     如果用户的问题与技能无关，正常回答即可
     用户可能用简称或描述性语言指代技能，你需要匹配到正确的技能名称或id"""
     return prompt
 
 
-SYSTEM_PROMPT = _build_system_prompt()
+ANIMAL_SYSTEM_PROMPT = _build_system_prompt(
+    animal_skill_registry,
+    "野生动物调查数据分析助手",
+    "数据分析技能和文件操作",
+)
+PLANT_SYSTEM_PROMPT = _build_system_prompt(
+    plant_skill_registry,
+    "陆生植物调查数据分析助手",
+    "陆生植物数据分析、报告撰写和文件操作",
+)
 
 
-# ========== 工具定义 ==========
+# ========== 工具定义（共享工具） ==========
 @tool
 def list_files(directory: str = ".") -> List[str]:
     """列出指定目录下的所有文件"""
@@ -254,94 +298,95 @@ def run_r(script_path: str, script_args: str) -> str:
         return f"执行异常：{e}"
 
 
-@tool
-def get_skill_info(skill_name: str) -> str:
-    """获取技能详细信息，包括参数说明和工作流步骤。在启动技能前必须先调用此工具了解参数要求。"""
-    full_skill, json_path = _load_full_skill(skill_name)
-    if full_skill is None:
-        return json_path  # 此时存的是错误信息
+def _make_skill_tools(registry: List[Dict]):
+    """为指定技能注册表创建 get_skill_info / launch_skill 工具（闭包绑定注册表）。"""
 
-    info = f"技能名称: {full_skill.get('name', skill_name)}\n"
-    info += f"技能ID: {full_skill.get('id', '')}\n"
-    info += f"描述: {full_skill.get('description', '无')}\n"
-    info += f"类型: {full_skill.get('type', '未指定')}\n"
-    info += f"配置文件: {json_path}\n"
+    def _load(skill_name: str) -> tuple:
+        return _load_full_skill_from(registry, skill_name)
 
-    params = full_skill.get("parameters", {})
-    if params:
-        info += "\n参数:\n"
-        for p, desc in params.items():
-            info += f"  - {p}: {desc}\n"
-    else:
-        info += "\n参数: 无\n"
+    @tool
+    def get_skill_info(skill_name: str) -> str:
+        """获取技能详细信息，包括参数说明和工作流步骤。在启动技能前必须先调用此工具了解参数要求。"""
+        full_skill, json_path = _load(skill_name)
+        if full_skill is None:
+            return json_path  # 此时存的是错误信息
 
-    workflow_steps = full_skill.get("workflow_steps")
-    if workflow_steps:
-        info += f"\n工作流步骤 (共{len(workflow_steps)}步):\n"
-        for step in workflow_steps:
-            step_type = "审核" if step.get("type") == "review" or step.get("review_point") else "执行"
-            info += f"  步骤{step['step']} [{step_type}]: {step.get('description', step.get('use_skill', '未知'))}\n"
-    elif full_skill.get("workflow"):
-        wf = full_skill["workflow"]
-        info += f"\n执行步骤 (共{len(wf)}步):\n"
-        for idx, step in enumerate(wf, 1):
-            info += f"  {idx}. {step.get('description', step.get('tool', '未知操作'))}\n"
+        info = f"技能名称: {full_skill.get('name', skill_name)}\n"
+        info += f"技能ID: {full_skill.get('id', '')}\n"
+        info += f"描述: {full_skill.get('description', '无')}\n"
+        info += f"类型: {full_skill.get('type', '未指定')}\n"
+        info += f"配置文件: {json_path}\n"
 
-    return info
-
-
-@tool
-def launch_skill(skill_name: str, params_json: str) -> str:
-    """启动技能执行。当所有必要参数已确认后调用此工具。"""
-    # 解析参数 JSON
-    try:
-        params = json.loads(params_json) if params_json.strip() else {}
-    except json.JSONDecodeError as e:
-        return f"参数格式错误，必须是合法JSON: {e}"
-
-    # 验证技能是否存在
-    full_skill, json_path = _load_full_skill(skill_name)
-    if full_skill is None:
-        return json_path  # 错误信息
-
-    # 检查必填参数
-    required_params = []
-    for p, desc in full_skill.get("parameters", {}).items():
-        if "必填" in desc or "必" in desc:
-            required_params.append(p)
-
-    missing = [p for p in required_params if p not in params]
-    if missing:
-        return f"缺少必填参数: {', '.join(missing)}。请先收集这些参数再启动。"
-
-    # 用 _replace_vars 解析参数中的模板变量，解析失败的置空
-    resolved_params = {}
-    for key, val in params.items():
-        if isinstance(val, str):
-            resolved = _replace_vars(val, params)
-            resolved_params[key] = resolved if resolved is not None else ""
+        params = full_skill.get("parameters", {})
+        if params:
+            info += "\n参数:\n"
+            for p, desc in params.items():
+                info += f"  - {p}: {desc}\n"
         else:
-            resolved_params[key] = val
+            info += "\n参数: 无\n"
 
-    # 移除值为空字符串的参数（让脚本使用自身默认值）
-    resolved_params = {k: v for k, v in resolved_params.items() if v != ""}
+        workflow_steps = full_skill.get("workflow_steps")
+        if workflow_steps:
+            info += f"\n工作流步骤 (共{len(workflow_steps)}步):\n"
+            for step in workflow_steps:
+                step_type = "审核" if step.get("type") == "review" or step.get("review_point") else "执行"
+                info += f"  步骤{step['step']} [{step_type}]: {step.get('description', step.get('use_skill', '未知'))}\n"
+        elif full_skill.get("workflow"):
+            wf = full_skill["workflow"]
+            info += f"\n执行步骤 (共{len(wf)}步):\n"
+            for idx, step in enumerate(wf, 1):
+                info += f"  {idx}. {step.get('description', step.get('tool', '未知操作'))}\n"
 
-    return json.dumps({
-        "action": "launch_skill",
-        "skill_name": skill_name,
-        "params": resolved_params,
-        "skill_type": full_skill.get("type"),
-        "has_workflow_steps": bool(full_skill.get("workflow_steps"))
-    }, ensure_ascii=False)
+        return info
+
+    @tool
+    def launch_skill(skill_name: str, params_json: str) -> str:
+        """启动技能执行。当所有必要参数已确认后调用此工具。"""
+        # 解析参数 JSON
+        try:
+            params = json.loads(params_json) if params_json.strip() else {}
+        except json.JSONDecodeError as e:
+            return f"参数格式错误，必须是合法JSON: {e}"
+
+        # 验证技能是否存在
+        full_skill, json_path = _load(skill_name)
+        if full_skill is None:
+            return json_path  # 错误信息
+
+        # 检查必填参数
+        required_params = []
+        for p, desc in full_skill.get("parameters", {}).items():
+            if "必填" in desc or "必" in desc:
+                required_params.append(p)
+
+        missing = [p for p in required_params if p not in params]
+        if missing:
+            return f"缺少必填参数: {', '.join(missing)}。请先收集这些参数再启动。"
+
+        # 用 _replace_vars 解析参数中的模板变量，解析失败的置空
+        resolved_params = {}
+        for key, val in params.items():
+            if isinstance(val, str):
+                resolved = _replace_vars(val, params)
+                resolved_params[key] = resolved if resolved is not None else ""
+            else:
+                resolved_params[key] = val
+
+        # 移除值为空字符串的参数（让脚本使用自身默认值）
+        resolved_params = {k: v for k, v in resolved_params.items() if v != ""}
+
+        return json.dumps({
+            "action": "launch_skill",
+            "skill_name": skill_name,
+            "params": resolved_params,
+            "skill_type": full_skill.get("type"),
+            "has_workflow_steps": bool(full_skill.get("workflow_steps"))
+        }, ensure_ascii=False)
+
+    return get_skill_info, launch_skill
 
 
-# 工具列表和节点
-all_tools = [get_skill_info, launch_skill, run_python, run_r, list_files, read_xlsx, read_docx]
-tool_node = ToolNode(all_tools)
-llm_with_tools = llm.bind_tools(all_tools)
-
-
-# ========== 辅助函数 ==========
+# ========== 辅助函数（领域无关） ==========
 
 def detect_step_type(step: Dict) -> str:
     """统一检测步骤类型"""
@@ -354,7 +399,7 @@ def detect_step_type(step: Dict) -> str:
     return "skill"
 
 
-def find_previous_skill_output(state: AgentState, current_idx: int) -> Dict:
+def find_previous_skill_output(state: AnalysisState, current_idx: int) -> Dict:
     """找到当前 review 步骤的上一个 skill 步骤输出"""
     steps = state["workflow_steps"]
     for i in range(current_idx - 1, -1, -1):
@@ -362,24 +407,6 @@ def find_previous_skill_output(state: AgentState, current_idx: int) -> Dict:
             step_key = f"step_{steps[i]['step']}"
             return state["step_outputs"].get(step_key, {})
     return {}
-
-
-def find_next_skill_steps(state: AgentState, current_idx: int) -> List[Dict]:
-    """找到 review 之后的所有步骤预览"""
-    steps = state["workflow_steps"]
-    next_steps = []
-    for i in range(current_idx + 1, len(steps)):
-        step = steps[i]
-        if detect_step_type(step) != "review":
-            cfg, _ = _load_full_skill(step["use_skill"])
-            if isinstance(cfg, dict):
-                next_steps.append({
-                    "step_num": step["step"],
-                    "skill_name": cfg.get("name", step["use_skill"]),
-                    "skill_id": step["use_skill"],
-                    "description": cfg.get("description", "")
-                })
-    return next_steps
 
 
 def parse_review_action(response: Dict) -> str:
@@ -395,7 +422,7 @@ def parse_review_action(response: Dict) -> str:
         return "abort"
 
 
-def build_params(state: AgentState, step: Dict, target_config: Dict) -> Dict:
+def build_params(state: AnalysisState, step: Dict, target_config: Dict) -> Dict:
     """构建技能执行参数，支持从多个上游步骤按索引选择文件"""
     params = {
         "work_dir": state.get("work_dir", "."),
@@ -406,8 +433,6 @@ def build_params(state: AgentState, step: Dict, target_config: Dict) -> Dict:
     }
 
     work_dir = params["work_dir"]
-
-    #print(f"步骤2开始前，{state.keys()} {state['step_outputs']}")
 
     # 处理 input_from
     if "input_from" in step:
@@ -463,10 +488,13 @@ def build_params(state: AgentState, step: Dict, target_config: Dict) -> Dict:
     return params
 
 
-def infer_input_file(step_num: int, state: AgentState) -> str:
+def infer_input_file(step_num: int, state: AnalysisState) -> str:
     """从步骤历史推断输入文件"""
     work_dir = state.get("work_dir", ".")
-    file_map = {1: "动物列表.xlsx", 2: "动物名录.xlsx"}
+    if state.get("domain") == "plant":
+        file_map = {1: "植物列表.xlsx", 2: "植物名录.xlsx"}
+    else:
+        file_map = {1: "动物列表.xlsx", 2: "动物名录.xlsx"}
     key = f"step_{step_num}"
     if key in state["step_outputs"]:
         files = state["step_outputs"][key].get("output_files", [])
@@ -554,7 +582,7 @@ def _clean_unresolved_script_args(script_args: List[str]) -> List[str]:
     return cleaned
 
 
-# ========== LLM Agent 层 ==========
+# ========== LLM Agent 层（领域无关的消息处理） ==========
 
 def _find_launch_tool_call(messages: list) -> Optional[Dict]:
     """从消息历史中找到最近的 launch_skill 工具调用"""
@@ -568,7 +596,6 @@ def _find_launch_tool_call(messages: list) -> Optional[Dict]:
 
 def _find_launch_tool_result(messages: list) -> Optional[str]:
     """从消息历史中找到 launch_skill 的 ToolMessage 内容"""
-    # 找到 launch_skill 的 tool_call_id
     launch_tc = _find_launch_tool_call(messages)
     if not launch_tc:
         return None
@@ -579,7 +606,7 @@ def _find_launch_tool_result(messages: list) -> Optional[str]:
     return None
 
 
-def _log_messages(state: AgentState, node_name: str = ""):
+def _log_messages(state: AnalysisState, node_name: str = ""):
     """打印当前消息流的摘要，便于调试"""
     messages = state.get("messages", [])
     if not messages:
@@ -601,67 +628,42 @@ def _log_messages(state: AgentState, node_name: str = ""):
             role = "📋 System"
 
         content = msg.content or ""
-        # 截断长内容
         if len(content) > 150:
             content = content[:150] + "..."
         print(f"  {prefix} [{i}] {role}: {content}")
 
 
-def chat_node(state: AgentState):
-    """LLM Agent 节点：理解意图、调用工具、收集参数、决定行动"""
-    # 构建消息列表
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-    response = llm_with_tools.invoke(messages)
-
-    # 打印 LLM 响应
-    if hasattr(response, 'tool_calls') and response.tool_calls:
-        tc_summary = ", ".join(
-            f"{tc['name']}({json.dumps(tc['args'], ensure_ascii=False)[:100]})" for tc in response.tool_calls)
-        print(f"[DEBUG] chat_node: LLM 调用工具 → {tc_summary}")
-    elif response.content:
-        preview = response.content[:200]
-        print(f"[DEBUG] chat_node: LLM 回复 → {preview}")
-
-    return {"messages": [response]}
-
-
-def chat_router(state: AgentState) -> str:
+def chat_router(state: AnalysisState) -> str:
     """决定 chat 节点后的路由"""
     last_message = state["messages"][-1] if state["messages"] else None
 
     if not isinstance(last_message, AIMessage):
         return "respond"
 
-    # LLM 做了工具调用
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
         tool_names = [tc["name"] for tc in last_message.tool_calls]
-        # 检查是否有 launch_skill 调用
         for tc in last_message.tool_calls:
             if tc["name"] == "launch_skill":
                 print(f"[DEBUG] chat_router: 检测到 launch_skill 调用, 参数: {tc['args']}")
-                return "tools_then_launch"  # 先让 ToolNode 执行，再 prepare
+                return "tools_then_launch"
         print(f"[DEBUG] chat_router: 普通工具调用: {tool_names}")
         return "tools"
 
-    # LLM 直接回复（无工具调用）
     content_preview = last_message.content[:100] if last_message.content else "(空)"
 
-    # 拦截：LLM 未调用 launch_skill 却声称执行完成
     if last_message.content and any(
             keyword in last_message.content
             for keyword in ["执行完成", "已执行", "已完成", "运行完成", "处理完成"]
     ):
         if not state.get("final_output"):
             print(f"[DEBUG] chat_router: ⚠️ LLM 编造执行结果，插入纠正消息重新调用")
-            # 不直接输出虚假回复，而是给 LLM 一个纠正指令让它重新调用 launch_skill
-            # 这里返回 "retry" 路由到一个纠正节点
             return "retry_with_correction"
 
     print(f"[DEBUG] chat_router: LLM 直接回复, 内容: {content_preview}")
     return "respond"
 
 
-def after_tools_router(state: AgentState) -> str:
+def after_tools_router(state: AnalysisState) -> str:
     """工具执行后的路由：检查 launch_skill 的返回结果"""
     launch_tc = _find_launch_tool_call(state["messages"])
     if launch_tc:
@@ -673,7 +675,6 @@ def after_tools_router(state: AgentState) -> str:
                 if "launch_skill" in msg.content:
                     print("[DEBUG] after_tools_router → prepare_launch")
                     return "prepare_launch"
-                # 返回的是错误信息（缺参数等）→ 回到 chat 让 LLM 处理
                 print("[DEBUG] after_tools_router → chat (launch_skill 返回错误)")
                 return "chat"
 
@@ -681,80 +682,7 @@ def after_tools_router(state: AgentState) -> str:
     return "chat"
 
 
-def prepare_launch_node(state: AgentState):
-    """处理 launch_skill 请求，设置工作流执行状态"""
-    # 找到 launch_skill 的工具调用
-    launch_tc = _find_launch_tool_call(state["messages"])
-
-    if not launch_tc:
-        print("[DEBUG] prepare_launch: 未找到 launch_skill 工具调用！")
-        return {
-            "execution_mode": "chat",
-            "messages": [SystemMessage(content="未找到有效的技能启动请求，请重新操作。")]
-        }
-
-    skill_name = launch_tc["args"].get("skill_name", "")
-    params_raw = launch_tc["args"].get("params_json", "{}")
-    print(f"[DEBUG] prepare_launch: skill_name={skill_name}, params_raw={params_raw}")
-
-    # 解析参数（LLM 可能传字符串或 dict）
-    if isinstance(params_raw, str):
-        try:
-            params = json.loads(params_raw)
-        except json.JSONDecodeError:
-            params = {}
-    elif isinstance(params_raw, dict):
-        params = params_raw
-    else:
-        params = {}
-
-        # 加载技能配置
-    full_skill, json_path = _load_full_skill(skill_name)
-    if full_skill is None:
-        return {
-            "execution_mode": "chat",
-            "messages": [SystemMessage(content=f"无法加载技能 '{skill_name}': {json_path}")]
-        }
-
-    # 判断执行模式
-    if full_skill.get("type") == "workflow" and full_skill.get("workflow_steps"):
-        mode = "workflow"
-        workflow_steps = full_skill["workflow_steps"]
-    else:
-        mode = "single_skill"
-        workflow_steps = []
-
-    print(f"[DEBUG] prepare_launch: mode={mode}, workflow_steps={len(workflow_steps)}步, params={params}")
-
-    # 构建状态更新
-    state_update = {
-        "execution_mode": mode,
-        "selected_skill": skill_name,
-        "skill_config": full_skill,
-        "workflow_steps": workflow_steps,
-        "current_step_idx": 0,
-        "step_outputs": {},
-        "retry_count": {},
-        "review_feedback": None,
-        "approved": None,
-        "review_action": None,
-        "error": None,
-        "final_output": None,
-        "skill_params": params.copy(),
-    }
-
-    # 合并参数到状态
-    param_fields = [
-        "work_dir", "input_file", "history_file", "pa", "regional_level"
-    ]
-    for field in param_fields:
-        if field in params and params[field]:
-            state_update[field] = params[field]
-
-    return state_update
-
-
-def mode_router(state: AgentState) -> str:
+def mode_router(state: AnalysisState) -> str:
     """根据 execution_mode 路由到对应的执行器"""
     mode = state.get("execution_mode", "chat")
     if mode == "workflow":
@@ -765,306 +693,20 @@ def mode_router(state: AgentState) -> str:
         return "chat"
 
 
-# ========== 工作流执行层 ==========
-
-def execute_step(state: AgentState) -> Dict:
-    """通用步骤执行器"""
-    steps = state["workflow_steps"]
-    current_idx = state["current_step_idx"]
-
-    if current_idx >= len(steps):
-        print(f"[DEBUG] execute_step: 所有步骤已完成")
-        return {"status": "completed"}
-
-    step = steps[current_idx]
-    step_type = detect_step_type(step)
-    print(f"[DEBUG] execute_step: 步骤 {current_idx + 1}/{len(steps)}, type={step_type}, detail={step}")
-
-    if step_type == "review":
-        return execute_review(state, step, current_idx)
+def subgraph_entry_router(state: AnalysisState) -> str:
+    """根据状态决定子图从哪个节点开始。"""
+    mode = state.get("execution_mode", "chat")
+    if mode == "workflow" and state.get("workflow_steps"):
+        return "executor"
+    elif mode == "single_skill" and state.get("skill_config"):
+        return "single_executor"
     else:
-        return execute_skill(state, step, current_idx)
+        return "chat"
 
 
-def execute_skill(state: AgentState, step: Dict, step_idx: int) -> Dict:
-    """执行 Skill 步骤"""
-    target_skill_id = step["use_skill"]
-    target_config, _json_path = _load_full_skill(target_skill_id)
+# ========== 执行层（领域无关节点） ==========
 
-    if target_config is None:
-        return {"error": f"无法加载技能 {target_skill_id}", "status": "error"}
-
-    per_params = build_params(state, step, target_config)
-    params = {k: v for k, v in per_params.items() if v != ""}
-    print(f"[DEBUG]execute_skill params :{params}")
-
-    results = []
-    for wf_step in target_config.get("workflow", []):
-        tool_name = wf_step.get("tool")
-        if tool_name == "run_python":
-            script_args = substitute_params(wf_step["params"]["script_args"], params)
-            script_args = _clean_unresolved_script_args(script_args)
-            print(f"[DEBUG]execute_skill script_args :{script_args}")
-            sa_str = " ".join(script_args) if isinstance(script_args, list) else script_args
-            print(f"[DEBUG] execute_skill: run_python {wf_step['params']['script_path']} script_args={sa_str}")
-            result = run_python.invoke({"script_path": wf_step["params"]["script_path"], "script_args": sa_str})
-            is_success = not result.startswith(("错误", "执行失败"))
-            results.append({
-                "tool": "run_python",
-                "script": wf_step["params"]["script_path"],
-                "description": wf_step.get("description", ""),
-                "result": result,
-                "success": is_success
-            })
-            # 执行失败，停止后续步骤
-            if not is_success:
-                return {
-                    "error": f"步骤 {step['step']} 执行失败: {result}",
-                    "status": "error",
-                    "step_outputs": {
-                        **state["step_outputs"],
-                        f"step_{step['step']}": {
-                            "step_idx": step_idx,
-                            "step_num": step["step"],
-                            "skill_id": target_skill_id,
-                            "skill_name": target_config.get("name"),
-                            "params": params,
-                            "results": results,
-                            "output_files": [],
-                        }
-                    }
-                }
-
-        elif tool_name == "run_r":
-            script_args = substitute_params(wf_step["params"]["script_args"], params)
-            script_args = _clean_unresolved_script_args(script_args)
-            sa_str = " ".join(script_args) if isinstance(script_args, list) else script_args
-            print(f"[DEBUG] execute_skill: run_r {wf_step['params']['script_path']} args={sa_str}")
-            result = run_r.invoke({"script_path": wf_step["params"]["script_path"], "script_args": sa_str})
-            is_success = not result.startswith(("错误", "执行失败"))
-            results.append({
-                "tool": "run_r",
-                "script": wf_step["params"]["script_path"],
-                "description": wf_step.get("description", ""),
-                "result": result,
-                "success": is_success
-            })
-            # 执行失败，停止后续步骤
-            if not is_success:
-                return {
-                    "error": f"步骤 {step['step']} 执行失败: {result}",
-                    "status": "error",
-                    "step_outputs": {
-                        **state["step_outputs"],
-                        f"step_{step['step']}": {
-                            "step_idx": step_idx,
-                            "step_num": step["step"],
-                            "skill_id": target_skill_id,
-                            "skill_name": target_config.get("name"),
-                            "params": params,
-                            "results": results,
-                            "output_files": [],
-                        }
-                    }
-                }
-
-    output_files = extract_output_files(results, params)
-    step_key = f"step_{step['step']}"
-    print(f"输出{output_files}")
-
-    return {
-        "step_outputs": {
-            **state["step_outputs"],
-            step_key: {
-                "step_idx": step_idx,
-                "step_num": step["step"],
-                "skill_id": target_skill_id,
-                "skill_name": target_config.get("name"),
-                "config_path": _json_path,
-                "params": params,
-                "results": results,
-                "output_files": output_files,
-            }
-        },
-        "current_step_idx": step_idx + 1,
-        "status": "step_completed"
-    }
-
-
-def execute_review(state: AgentState, step: Dict, step_idx: int) -> Dict:
-    """执行 Review 步骤：中断等待人工审核"""
-    prev_output = find_previous_skill_output(state, step_idx)
-    next_steps = find_next_skill_steps(state, step_idx)
-
-    step_num = step['step']
-    step_desc = step.get("description", "未命名步骤")
-    workflow_name = state["skill_config"].get("name", "未命名工作流")
-    retry_count = state["retry_count"].get(f"step_{prev_output.get('step_num', 'unknown')}", 0)
-
-    lines = [
-        "=" * 50,
-        f"🔍 工作流审核请求 | {workflow_name}",
-        "=" * 50,
-        "",
-        f"步骤编号: {step_num}",
-        f"步骤描述: {step_desc}",
-        f"重试次数: {retry_count}",
-        "",
-        "-" * 50,
-        "📋 上一步执行结果:",
-        "-" * 50,
-    ]
-
-    # 添加上一步输出内容
-    if prev_output:
-        prev_step = prev_output.get('step_num', 'N/A')
-        prev_status = prev_output.get('status', 'unknown')
-        lines.append(f"  步骤: {prev_step}")
-        lines.append(f"  状态: {prev_status}")
-
-        # 添加输出内容（如果是字符串直接展示，如果是字典则格式化）
-        output_content = prev_output.get('output', prev_output.get('result', {}))
-        if isinstance(output_content, dict):
-            for k, v in output_content.items():
-                v_str = str(v)[:500] + "..." if len(str(v)) > 500 else str(v)
-                lines.append(f"  {k}: {v_str}")
-        else:
-            content_str = str(output_content)[:1000]
-            lines.append(f"  结果: {content_str}")
-    else:
-        lines.append("  （无上一步输出）")
-
-    lines.extend([
-        "",
-        "-" * 50,
-        "📎 后续待执行步骤:",
-        "-" * 50,
-    ])
-
-    if next_steps:
-        for i, ns in enumerate(next_steps, 1):
-            ns_step = ns.get('step', 'N/A')
-            ns_desc = ns.get('description', '未描述')
-            ns_type = ns.get('type', 'unknown')
-            lines.append(f"  {i}. [{ns_type}] 步骤 {ns_step}: {ns_desc}")
-    else:
-        lines.append("  （无后续步骤）")
-
-    lines.extend([
-        "",
-        "=" * 50,
-        "⚡ 可执行操作（请回复对应指令）:",
-        "=" * 50,
-        "  [通过 / continue / 确认]  → 确认结果正确，继续执行后续步骤",
-        "  [重新执行 / retry / 重试]  → 重新执行上一步骤",
-        "  [终止 / stop / 结束]      → 终止整个工作流",
-        "",
-        "💬 附加反馈（可选）: 可在指令后补充说明原因或修改建议",
-        "=" * 50,
-    ])
-
-    review_text = "\n".join(lines)
-
-    # 发送文本形式的中断请求
-    response = interrupt({
-        "review_type": "workflow_intermediate",
-        "review_id": f"review_{step_num}",
-        "title": f"审核步骤 {step_num}: {step_desc}",
-        "workflow_name": workflow_name,
-        "content_text": review_text,  # 文本格式便于阅读
-        "content_structured": {  # 保留结构化数据供程序解析
-            "previous_step": prev_output,
-            "next_steps_preview": next_steps,
-            "retry_count": retry_count
-        }
-    })
-
-    action = parse_review_action(response)
-
-    # 构建返回结果
-    return {
-        "approved": action == "continue",
-        "review_feedback": response.get("feedback", ""),
-        "review_action": action,
-        "review_text": review_text,  # 保留文本便于日志记录
-        "step_outputs": {
-            **state["step_outputs"],
-            f"step_{step_num}": {
-                "type": "review",
-                "review_data": response,
-                "step_idx": step_idx
-            }
-        }
-    }
-
-
-def step_executor_node(state: AgentState):
-    """步骤执行节点包装器，支持错误中断与重试"""
-    result = execute_step(state)
-    status = result.get("status", "unknown")
-
-    # 处理执行错误：中断等待用户决策
-    if status == "error":
-        error_msg = result.get("error", "未知错误")
-        step_num = state["workflow_steps"][state["current_step_idx"]]["step"]
-        interrupt_request = {
-            "type": "execution_error",
-            "step_num": step_num,
-            "error": error_msg,
-            "actions": {
-                "retry": "重新执行当前步骤（使用相同参数）",
-                "abort": "终止工作流"
-            }
-        }
-        # 暂停图，等待用户输入
-        user_choice = interrupt(interrupt_request)
-        action = user_choice.get("action")
-
-        if action == "retry":
-            # 清除当前步骤的输出，保持索引不变
-            step_key = f"step_{step_num}"
-            cleaned_outputs = dict(state["step_outputs"])
-            cleaned_outputs.pop(step_key, None)
-            return {
-                "step_outputs": cleaned_outputs,
-                "current_step_idx": state["current_step_idx"],
-                "error": None,
-                "status": "retry_current",  # 触发重试
-                "review_action": None,
-                "review_feedback": None
-            }
-        else:  # abort
-            return {
-                "review_action": "abort",
-                "review_feedback": f"执行错误后用户终止: {error_msg}",
-                "final_output": {
-                    "skill": state["selected_skill"],
-                    "status": "aborted",
-                    "reason": f"执行错误后用户终止: {error_msg}",
-                    "step_outputs": state["step_outputs"]
-                }
-            }
-
-    # 正常步骤完成推进索引
-    if status == "step_completed":
-        return {"current_step_idx": result["current_step_idx"],
-                "step_outputs": result.get("step_outputs", {})
-                }
-
-    if status == "completed":
-        return {
-            "step_outputs": result.get("step_outputs", {}),
-            "final_output": {
-                "skill": state["selected_skill"],
-                "status": "completed",
-                "step_outputs": state["step_outputs"]
-            }
-        }
-
-    return result
-
-
-def single_executor_node(state: AgentState):
+def single_executor_node(state: AnalysisState):
     """单个步骤技能执行节点，支持任意用户参数"""
     config = state["skill_config"]
     workflow = config.get("workflow", [])
@@ -1072,22 +714,18 @@ def single_executor_node(state: AgentState):
     results = []
     has_error = False
 
-    # 获取用户提供的所有参数（优先级最高）
     skill_params = state.get("skill_params", {})
 
-    # 同时保留从 state 顶层获取的全局参数（向后兼容）
     global_params = {}
     global_fields = ["work_dir", "input_file", "pa", "history_file", "regional_level"]
     for field in global_fields:
         if field in state:
             global_params[field] = state[field]
 
-    # 合并：用户参数 > 全局参数 > 技能默认参数（如果有）
     replace_vars = {}
     replace_vars.update(global_params)
     replace_vars.update(skill_params)
 
-    # 如果技能配置中有默认参数，也加入（但会被用户参数覆盖）
     if isinstance(state.get("skill_config"), dict):
         defaults = state["skill_config"].get("default_params", {})
         replace_vars.update(defaults)
@@ -1097,7 +735,6 @@ def single_executor_node(state: AgentState):
         params = step.get("params", {})
         script_path = params.get("script_path", "未知")
 
-        # 替换 script_args 中的模板变量（例如 {input_file1}）
         script_args = substitute_params(params.get("script_args", []), replace_vars)
         script_args = _clean_unresolved_script_args(script_args)
         sa_str = " ".join(script_args) if isinstance(script_args, list) else script_args
@@ -1156,7 +793,7 @@ def single_executor_node(state: AgentState):
     }
 
 
-def retry_node_fn(state: AgentState, target_idx: int):
+def retry_node_fn(state: AnalysisState, target_idx: int):
     """重试节点：回退到指定步骤，清理之后的输出"""
     steps = state["workflow_steps"]
     cleaned_outputs = dict(state["step_outputs"])
@@ -1173,7 +810,7 @@ def retry_node_fn(state: AgentState, target_idx: int):
     }
 
 
-def continue_node(state: AgentState):
+def continue_node(state: AnalysisState):
     """继续节点：跳过 review 步骤"""
     current_idx = state["current_step_idx"]
     return {
@@ -1184,9 +821,8 @@ def continue_node(state: AgentState):
     }
 
 
-def abort_node(state: AgentState):
+def abort_node(state: AnalysisState):
     """终止节点"""
-    # 优先使用 review_feedback；若为空则回退到已有 final_output 的 reason，最后才用默认文案
     reason = state.get("review_feedback") or "用户终止"
     existing = state.get("final_output")
     if isinstance(existing, dict) and existing.get("reason"):
@@ -1201,7 +837,7 @@ def abort_node(state: AgentState):
     }
 
 
-def complete_node(state: AgentState):
+def complete_node(state: AnalysisState):
     """完成节点"""
     return {
         "final_output": {
@@ -1212,7 +848,7 @@ def complete_node(state: AgentState):
     }
 
 
-def correction_node(state: AgentState):
+def correction_node(state: AnalysisState):
     """纠正节点：当 LLM 编造执行结果时，插入纠正消息强制其调用 launch_skill"""
     correction_msg = SystemMessage(
         content="⚠️ 你刚才声称技能已执行，但你并没有调用 launch_skill 工具！"
@@ -1222,14 +858,12 @@ def correction_node(state: AgentState):
     return {"messages": [correction_msg]}
 
 
-def report_results_node(state: AgentState):
+def report_results_node(state: AnalysisState):
     """执行结束节点：重置模式，结果由父图 plan 节点反馈给用户"""
     return {"execution_mode": "chat"}
 
 
-# ========== 路由逻辑 ==========
-
-def find_previous_skill_idx(state: AgentState) -> Optional[int]:
+def find_previous_skill_idx(state: AnalysisState) -> Optional[int]:
     """找到上一个 skill 步骤的索引"""
     current_idx = state["current_step_idx"]
     steps = state["workflow_steps"]
@@ -1239,13 +873,11 @@ def find_previous_skill_idx(state: AgentState) -> Optional[int]:
     return None
 
 
-def workflow_router(state: AgentState) -> str:
+def workflow_router(state: AnalysisState) -> str:
     """工作流执行路由"""
-    # 步骤全部完成
     if state["current_step_idx"] >= len(state["workflow_steps"]):
         return "workflow_complete"
 
-    # 处理 Review 结果
     action = state.get("review_action")
     if action == "abort":
         return "workflow_abort"
@@ -1260,115 +892,510 @@ def workflow_router(state: AgentState) -> str:
     if action == "continue":
         return "continue_step"
 
-    # 正常执行下一步
     return "execute_step"
 
 
-# ============================================================
-# 修改子图入口：增加条件路由，使父图可以直接分发工作流
-# ============================================================
+# ========== 子图工厂 ==========
 
-def subgraph_entry_router(state: AgentState) -> str:
-    """
-    根据状态决定子图从哪个节点开始。
-    如果状态中已有 workflow_steps 且 execution_mode 为 workflow 或 single_skill，
-    则直接进入执行器，跳过 chat 层。
-    """
-    mode = state.get("execution_mode", "chat")
-    if mode == "workflow" and state.get("workflow_steps"):
-        return "executor"
-    elif mode == "single_skill" and state.get("skill_config"):
-        return "single_executor"
-    else:
-        return "sub_animal_date_analysis_chat"
+def build_analysis_subgraph(
+    *,
+    domain: str,
+    state_cls,
+    chat_node_name: str,
+    registry: List[Dict],
+    system_prompt: str,
+    llm_with_tools,
+    tool_node,
+):
+    """构建一个数据分析子图（动物或植物），闭包绑定各自的技能注册表与提示词。"""
+
+    def _load(skill_name: str) -> tuple:
+        return _load_full_skill_from(registry, skill_name)
+
+    # ---- 领域相关节点 ----
+
+    def chat_node(state: AnalysisState):
+        """LLM Agent 节点：理解意图、调用工具、收集参数、决定行动"""
+        messages = [SystemMessage(content=system_prompt)] + state["messages"]
+        response = llm_with_tools.invoke(messages)
+
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            tc_summary = ", ".join(
+                f"{tc['name']}({json.dumps(tc['args'], ensure_ascii=False)[:100]})" for tc in response.tool_calls)
+            print(f"[DEBUG] chat_node({domain}): LLM 调用工具 → {tc_summary}")
+        elif response.content:
+            preview = response.content[:200]
+            print(f"[DEBUG] chat_node({domain}): LLM 回复 → {preview}")
+
+        return {"messages": [response]}
+
+    def find_next_skill_steps(state: AnalysisState, current_idx: int) -> List[Dict]:
+        """找到 review 之后的所有步骤预览"""
+        steps = state["workflow_steps"]
+        next_steps = []
+        for i in range(current_idx + 1, len(steps)):
+            step = steps[i]
+            if detect_step_type(step) != "review":
+                cfg, _ = _load(step["use_skill"])
+                if isinstance(cfg, dict):
+                    next_steps.append({
+                        "step_num": step["step"],
+                        "skill_name": cfg.get("name", step["use_skill"]),
+                        "skill_id": step["use_skill"],
+                        "description": cfg.get("description", "")
+                    })
+        return next_steps
+
+    def prepare_launch_node(state: AnalysisState):
+        """处理 launch_skill 请求，设置工作流执行状态"""
+        launch_tc = _find_launch_tool_call(state["messages"])
+
+        if not launch_tc:
+            print("[DEBUG] prepare_launch: 未找到 launch_skill 工具调用！")
+            return {
+                "execution_mode": "chat",
+                "messages": [SystemMessage(content="未找到有效的技能启动请求，请重新操作。")]
+            }
+
+        skill_name = launch_tc["args"].get("skill_name", "")
+        params_raw = launch_tc["args"].get("params_json", "{}")
+        print(f"[DEBUG] prepare_launch: skill_name={skill_name}, params_raw={params_raw}")
+
+        if isinstance(params_raw, str):
+            try:
+                params = json.loads(params_raw)
+            except json.JSONDecodeError:
+                params = {}
+        elif isinstance(params_raw, dict):
+            params = params_raw
+        else:
+            params = {}
+
+        full_skill, json_path = _load(skill_name)
+        if full_skill is None:
+            return {
+                "execution_mode": "chat",
+                "messages": [SystemMessage(content=f"无法加载技能 '{skill_name}': {json_path}")]
+            }
+
+        if full_skill.get("type") == "workflow" and full_skill.get("workflow_steps"):
+            mode = "workflow"
+            workflow_steps = full_skill["workflow_steps"]
+        else:
+            mode = "single_skill"
+            workflow_steps = []
+
+        print(f"[DEBUG] prepare_launch: mode={mode}, workflow_steps={len(workflow_steps)}步, params={params}")
+
+        state_update = {
+            "execution_mode": mode,
+            "selected_skill": skill_name,
+            "skill_config": full_skill,
+            "workflow_steps": workflow_steps,
+            "current_step_idx": 0,
+            "step_outputs": {},
+            "retry_count": {},
+            "review_feedback": None,
+            "approved": None,
+            "review_action": None,
+            "error": None,
+            "final_output": None,
+            "skill_params": params.copy(),
+            "domain": domain,
+        }
+
+        param_fields = [
+            "work_dir", "input_file", "history_file", "pa", "regional_level"
+        ]
+        for field in param_fields:
+            if field in params and params[field]:
+                state_update[field] = params[field]
+
+        return state_update
+
+    def execute_skill(state: AnalysisState, step: Dict, step_idx: int) -> Dict:
+        """执行 Skill 步骤"""
+        target_skill_id = step["use_skill"]
+        target_config, _json_path = _load(target_skill_id)
+
+        if target_config is None:
+            return {"error": f"无法加载技能 {target_skill_id}", "status": "error"}
+
+        per_params = build_params(state, step, target_config)
+        params = {k: v for k, v in per_params.items() if v != ""}
+        print(f"[DEBUG] execute_skill params :{params}")
+
+        results = []
+        for wf_step in target_config.get("workflow", []):
+            tool_name = wf_step.get("tool")
+            if tool_name == "run_python":
+                script_args = substitute_params(wf_step["params"]["script_args"], params)
+                script_args = _clean_unresolved_script_args(script_args)
+                print(f"[DEBUG] execute_skill script_args :{script_args}")
+                sa_str = " ".join(script_args) if isinstance(script_args, list) else script_args
+                print(f"[DEBUG] execute_skill: run_python {wf_step['params']['script_path']} script_args={sa_str}")
+                result = run_python.invoke({"script_path": wf_step["params"]["script_path"], "script_args": sa_str})
+                is_success = not result.startswith(("错误", "执行失败"))
+                results.append({
+                    "tool": "run_python",
+                    "script": wf_step["params"]["script_path"],
+                    "description": wf_step.get("description", ""),
+                    "result": result,
+                    "success": is_success
+                })
+                if not is_success:
+                    return {
+                        "error": f"步骤 {step['step']} 执行失败: {result}",
+                        "status": "error",
+                        "step_outputs": {
+                            **state["step_outputs"],
+                            f"step_{step['step']}": {
+                                "step_idx": step_idx,
+                                "step_num": step["step"],
+                                "skill_id": target_skill_id,
+                                "skill_name": target_config.get("name"),
+                                "params": params,
+                                "results": results,
+                                "output_files": [],
+                            }
+                        }
+                    }
+
+            elif tool_name == "run_r":
+                script_args = substitute_params(wf_step["params"]["script_args"], params)
+                script_args = _clean_unresolved_script_args(script_args)
+                sa_str = " ".join(script_args) if isinstance(script_args, list) else script_args
+                print(f"[DEBUG] execute_skill: run_r {wf_step['params']['script_path']} args={sa_str}")
+                result = run_r.invoke({"script_path": wf_step["params"]["script_path"], "script_args": sa_str})
+                is_success = not result.startswith(("错误", "执行失败"))
+                results.append({
+                    "tool": "run_r",
+                    "script": wf_step["params"]["script_path"],
+                    "description": wf_step.get("description", ""),
+                    "result": result,
+                    "success": is_success
+                })
+                if not is_success:
+                    return {
+                        "error": f"步骤 {step['step']} 执行失败: {result}",
+                        "status": "error",
+                        "step_outputs": {
+                            **state["step_outputs"],
+                            f"step_{step['step']}": {
+                                "step_idx": step_idx,
+                                "step_num": step["step"],
+                                "skill_id": target_skill_id,
+                                "skill_name": target_config.get("name"),
+                                "params": params,
+                                "results": results,
+                                "output_files": [],
+                            }
+                        }
+                    }
+
+        output_files = extract_output_files(results, params)
+        step_key = f"step_{step['step']}"
+        print(f"输出{output_files}")
+
+        return {
+            "step_outputs": {
+                **state["step_outputs"],
+                step_key: {
+                    "step_idx": step_idx,
+                    "step_num": step["step"],
+                    "skill_id": target_skill_id,
+                    "skill_name": target_config.get("name"),
+                    "config_path": _json_path,
+                    "params": params,
+                    "results": results,
+                    "output_files": output_files,
+                }
+            },
+            "current_step_idx": step_idx + 1,
+            "status": "step_completed"
+        }
+
+    def execute_review(state: AnalysisState, step: Dict, step_idx: int) -> Dict:
+        """执行 Review 步骤：中断等待人工审核"""
+        prev_output = find_previous_skill_output(state, step_idx)
+        next_steps = find_next_skill_steps(state, step_idx)
+
+        step_num = step['step']
+        step_desc = step.get("description", "未命名步骤")
+        workflow_name = state["skill_config"].get("name", "未命名工作流")
+        retry_count = state["retry_count"].get(f"step_{prev_output.get('step_num', 'unknown')}", 0)
+
+        lines = [
+            "=" * 50,
+            f"🔍 工作流审核请求 | {workflow_name}",
+            "=" * 50,
+            "",
+            f"步骤编号: {step_num}",
+            f"步骤描述: {step_desc}",
+            f"重试次数: {retry_count}",
+            "",
+            "-" * 50,
+            "📋 上一步执行结果:",
+            "-" * 50,
+        ]
+
+        if prev_output:
+            prev_step = prev_output.get('step_num', 'N/A')
+            prev_status = prev_output.get('status', 'unknown')
+            lines.append(f"  步骤: {prev_step}")
+            lines.append(f"  状态: {prev_status}")
+
+            output_content = prev_output.get('output', prev_output.get('result', {}))
+            if isinstance(output_content, dict):
+                for k, v in output_content.items():
+                    v_str = str(v)[:500] + "..." if len(str(v)) > 500 else str(v)
+                    lines.append(f"  {k}: {v_str}")
+            else:
+                content_str = str(output_content)[:1000]
+                lines.append(f"  结果: {content_str}")
+        else:
+            lines.append("  （无上一步输出）")
+
+        lines.extend([
+            "",
+            "-" * 50,
+            "📎 后续待执行步骤:",
+            "-" * 50,
+        ])
+
+        if next_steps:
+            for i, ns in enumerate(next_steps, 1):
+                ns_step = ns.get('step', 'N/A')
+                ns_desc = ns.get('description', '未描述')
+                ns_type = ns.get('type', 'unknown')
+                lines.append(f"  {i}. [{ns_type}] 步骤 {ns_step}: {ns_desc}")
+        else:
+            lines.append("  （无后续步骤）")
+
+        lines.extend([
+            "",
+            "=" * 50,
+            "⚡ 可执行操作（请回复对应指令）:",
+            "=" * 50,
+            "  [通过 / continue / 确认]  → 确认结果正确，继续执行后续步骤",
+            "  [重新执行 / retry / 重试]  → 重新执行上一步骤",
+            "  [终止 / stop / 结束]      → 终止整个工作流",
+            "",
+            "💬 附加反馈（可选）: 可在指令后补充说明原因或修改建议",
+            "=" * 50,
+        ])
+
+        review_text = "\n".join(lines)
+
+        response = interrupt({
+            "review_type": "workflow_intermediate",
+            "review_id": f"review_{step_num}",
+            "title": f"审核步骤 {step_num}: {step_desc}",
+            "workflow_name": workflow_name,
+            "content_text": review_text,
+            "content_structured": {
+                "previous_step": prev_output,
+                "next_steps_preview": next_steps,
+                "retry_count": retry_count
+            }
+        })
+
+        action = parse_review_action(response)
+
+        return {
+            "approved": action == "continue",
+            "review_feedback": response.get("feedback", ""),
+            "review_action": action,
+            "review_text": review_text,
+            "step_outputs": {
+                **state["step_outputs"],
+                f"step_{step_num}": {
+                    "type": "review",
+                    "review_data": response,
+                    "step_idx": step_idx
+                }
+            }
+        }
+
+    def execute_step(state: AnalysisState) -> Dict:
+        """通用步骤执行器"""
+        steps = state["workflow_steps"]
+        current_idx = state["current_step_idx"]
+
+        if current_idx >= len(steps):
+            print(f"[DEBUG] execute_step: 所有步骤已完成")
+            return {"status": "completed"}
+
+        step = steps[current_idx]
+        step_type = detect_step_type(step)
+        print(f"[DEBUG] execute_step: 步骤 {current_idx + 1}/{len(steps)}, type={step_type}, detail={step}")
+
+        if step_type == "review":
+            return execute_review(state, step, current_idx)
+        else:
+            return execute_skill(state, step, current_idx)
+
+    def step_executor_node(state: AnalysisState):
+        """步骤执行节点包装器，支持错误中断与重试"""
+        result = execute_step(state)
+        status = result.get("status", "unknown")
+
+        if status == "error":
+            error_msg = result.get("error", "未知错误")
+            step_num = state["workflow_steps"][state["current_step_idx"]]["step"]
+            interrupt_request = {
+                "type": "execution_error",
+                "step_num": step_num,
+                "error": error_msg,
+                "actions": {
+                    "retry": "重新执行当前步骤（使用相同参数）",
+                    "abort": "终止工作流"
+                }
+            }
+            user_choice = interrupt(interrupt_request)
+            action = user_choice.get("action")
+
+            if action == "retry":
+                step_key = f"step_{step_num}"
+                cleaned_outputs = dict(state["step_outputs"])
+                cleaned_outputs.pop(step_key, None)
+                return {
+                    "step_outputs": cleaned_outputs,
+                    "current_step_idx": state["current_step_idx"],
+                    "error": None,
+                    "status": "retry_current",
+                    "review_action": None,
+                    "review_feedback": None
+                }
+            else:
+                return {
+                    "review_action": "abort",
+                    "review_feedback": f"执行错误后用户终止: {error_msg}",
+                    "final_output": {
+                        "skill": state["selected_skill"],
+                        "status": "aborted",
+                        "reason": f"执行错误后用户终止: {error_msg}",
+                        "step_outputs": state["step_outputs"]
+                    }
+                }
+
+        if status == "step_completed":
+            return {"current_step_idx": result["current_step_idx"],
+                    "step_outputs": result.get("step_outputs", {})
+                    }
+
+        if status == "completed":
+            return {
+                "step_outputs": result.get("step_outputs", {}),
+                "final_output": {
+                    "skill": state["selected_skill"],
+                    "status": "completed",
+                    "step_outputs": state["step_outputs"]
+                }
+            }
+
+        return result
+
+    # ---- 构建子图 ----
+    builder = StateGraph(state_cls)
+
+    builder.add_node(chat_node_name, chat_node)
+    builder.add_node("tools", tool_node)
+    builder.add_node("prepare_launch", prepare_launch_node)
+    builder.add_node("correction", correction_node)
+    builder.add_node("executor", step_executor_node)
+    builder.add_node("single_executor", single_executor_node)
+    builder.add_node("continue", continue_node)
+    builder.add_node("abort", abort_node)
+    builder.add_node("complete", complete_node)
+    builder.add_node("report_results", report_results_node)
+
+    for i in range(3):
+        builder.add_node(f"retry_{i}", lambda s, idx=i: retry_node_fn(s, idx))
+
+    builder.add_conditional_edges(START, subgraph_entry_router, {
+        "chat": chat_node_name,
+        "executor": "executor",
+        "single_executor": "single_executor",
+    })
+
+    builder.add_conditional_edges(chat_node_name, chat_router, {
+        "tools": "tools",
+        "tools_then_launch": "tools",
+        "prepare_launch": "prepare_launch",
+        "retry_with_correction": "correction",
+        "respond": END,
+    })
+
+    builder.add_edge("correction", chat_node_name)
+
+    builder.add_conditional_edges("tools", after_tools_router, {
+        "chat": chat_node_name,
+        "prepare_launch": "prepare_launch",
+    })
+
+    builder.add_conditional_edges("prepare_launch", mode_router, {
+        "workflow": "executor",
+        "single_skill": "single_executor",
+        "chat": chat_node_name,
+    })
+
+    builder.add_conditional_edges("executor", workflow_router, {
+        "workflow_complete": "complete",
+        "workflow_abort": "abort",
+        "execute_step": "executor",
+        "continue_step": "continue",
+        **{f"retry_step_{i}": f"retry_{i}" for i in range(3)}
+    })
+
+    builder.add_edge("continue", "executor")
+    for i in range(3):
+        builder.add_edge(f"retry_{i}", "executor")
+
+    builder.add_edge("complete", "report_results")
+    builder.add_edge("abort", "report_results")
+    builder.add_edge("single_executor", "report_results")
+    builder.add_edge("report_results", END)
+
+    return builder.compile(checkpointer=checkpointer)
 
 
-# ========== 构建子图 ==========
-builder = StateGraph(AgentState)
-
-# --- Chat 层节点 ---
-builder.add_node("sub_animal_date_analysis_chat", chat_node)
-builder.add_node("tools", tool_node)
-builder.add_node("prepare_launch", prepare_launch_node)
-builder.add_node("correction", correction_node)
-
-# --- 执行层节点 ---
-builder.add_node("executor", step_executor_node)
-builder.add_node("single_executor", single_executor_node)
-builder.add_node("continue", continue_node)
-builder.add_node("abort", abort_node)
-builder.add_node("complete", complete_node)
-builder.add_node("report_results", report_results_node)
-
-# 动态注册重试节点
-for i in range(3):
-    builder.add_node(f"retry_{i}", lambda s, idx=i: retry_node_fn(s, idx))
-
-# --- 边 ---
-# 入口 → 条件路由
-builder.add_conditional_edges(START, subgraph_entry_router, {
-    "sub_animal_date_analysis_chat": "sub_animal_date_analysis_chat",
-    "executor": "executor",
-    "single_executor": "single_executor",
-})
-
-# chat 路由
-builder.add_conditional_edges("sub_animal_date_analysis_chat", chat_router, {
-    "tools": "tools",
-    "tools_then_launch": "tools",
-    "prepare_launch": "prepare_launch",
-    "retry_with_correction": "correction",
-    "respond": END,
-})
-
-# 纠正节点 → 回到 chat
-builder.add_edge("correction", "sub_animal_date_analysis_chat")
-
-# tools 执行后路由
-builder.add_conditional_edges("tools", after_tools_router, {
-    "chat": "sub_animal_date_analysis_chat",
-    "prepare_launch": "prepare_launch",
-})
-
-# prepare_launch → 根据 mode 路由
-builder.add_conditional_edges("prepare_launch", mode_router, {
-    "workflow": "executor",
-    "single_skill": "single_executor",
-    "chat": "sub_animal_date_analysis_chat",
-})
-
-# --- 工作流执行路由 ---
-builder.add_conditional_edges("executor", workflow_router, {
-    "workflow_complete": "complete",
-    "workflow_abort": "abort",
-    "execute_step": "executor",
-    "continue_step": "continue",
-    **{f"retry_step_{i}": f"retry_{i}" for i in range(3)}
-})
-
-builder.add_edge("continue", "executor")
-for i in range(3):
-    builder.add_edge(f"retry_{i}", "executor")
-
-# 完成和终止 → 报告结果 → 回到 chat
-builder.add_edge("complete", "report_results")
-builder.add_edge("abort", "report_results")
-builder.add_edge("single_executor", "report_results")
-
-# 报告结果后结束子图，由父图 plan 节点反馈结果
-builder.add_edge("report_results", END)
-
-# 编译子图
+# ========== 构建两个子图 ==========
 checkpointer = MemorySaver()
-animal_date_analysis_agent = builder.compile(checkpointer=checkpointer)
+
+animal_get_skill_info, animal_launch_skill = _make_skill_tools(animal_skill_registry)
+animal_all_tools = [animal_get_skill_info, animal_launch_skill, run_python, run_r, list_files, read_xlsx, read_docx]
+animal_tool_node = ToolNode(animal_all_tools)
+animal_llm_with_tools = llm.bind_tools(animal_all_tools)
+
+animal_date_analysis_agent = build_analysis_subgraph(
+    domain="animal",
+    state_cls=AnalysisState,
+    chat_node_name="animal_date_analysis_chat",
+    registry=animal_skill_registry,
+    system_prompt=ANIMAL_SYSTEM_PROMPT,
+    llm_with_tools=animal_llm_with_tools,
+    tool_node=animal_tool_node,
+)
+
+plant_get_skill_info, plant_launch_skill = _make_skill_tools(plant_skill_registry)
+plant_all_tools = [plant_get_skill_info, plant_launch_skill, run_python, run_r, list_files, read_xlsx, read_docx]
+plant_tool_node = ToolNode(plant_all_tools)
+plant_llm_with_tools = llm.bind_tools(plant_all_tools)
+
+plant_date_analysis_agent = build_analysis_subgraph(
+    domain="plant",
+    state_cls=AnalysisState,
+    chat_node_name="plant_date_analysis_chat",
+    registry=plant_skill_registry,
+    system_prompt=PLANT_SYSTEM_PROMPT,
+    llm_with_tools=plant_llm_with_tools,
+    tool_node=plant_tool_node,
+)
 
 
 # ============================================================
-# 父图：负责检索与规划，并将任务分发至子图
-# ============================================================
-
-# ============================================================
-# 父图：独立的协调层，不复用子图的节点、工具或技能配置
+# 父图：负责检索与规划，并将任务分发至对应子图
 # ============================================================
 
 # ---------- 混合检索（语义 + 关键词，RRF 融合） ----------
@@ -1485,15 +1512,13 @@ def _read_sop_chunks() -> List[str]:
     if os.path.exists(SOP_DOCX_PATH):
         try:
             loader = DoclingLoader(SOP_DOCX_PATH)
-            documents = loader.load()  # 返回 List[langchain_core.documents.Document]
+            documents = loader.load()
 
-            # 2. 初始化分割器
             text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
                 chunk_size=500,
                 chunk_overlap=50,
             )
 
-            # 3. 分割文档
             chunks = text_splitter.split_documents(documents)
             print(f"[VEC] 已从 SOP 文档加载 {len(chunks)} 个文本块: {SOP_DOCX_PATH}")
         except Exception as e:
@@ -1566,12 +1591,15 @@ def retrieve_sop_chunks(query: str, k: int = 5) -> List[str]:
 
 
 def load_parent_skill_catalog() -> List[Dict]:
-    """父图规划所需的完整技能目录（含名称/id/描述/参数/工作流步骤）。"""
+    """父图规划所需的完整技能目录（动物 + 植物，带 domain 标记）。"""
     catalog = []
-    for s in skill_registry:
-        cfg, _ = _load_full_skill(s["name"])
-        if isinstance(cfg, dict):
-            catalog.append(cfg)
+    for domain, registry in [("animal", animal_skill_registry), ("plant", plant_skill_registry)]:
+        for s in registry:
+            cfg, _ = _load_full_skill_from(registry, s["name"])
+            if isinstance(cfg, dict):
+                cfg = dict(cfg)
+                cfg["_domain"] = domain
+                catalog.append(cfg)
     return catalog
 
 
@@ -1622,11 +1650,14 @@ parent_llm_with_tools = parent_llm.bind_tools(parent_tools)
 def _build_parent_system_prompt() -> str:
     skill_list = ""
     for cfg in parent_skill_registry:
-        skill_list += f"  - {cfg.get('name')}（id: {cfg.get('id')}）: {cfg.get('description', '')}\n"
+        domain = "陆生动物" if cfg.get("_domain") == "animal" else "陆生植物"
+        skill_list += f"  - [{domain}] {cfg.get('name')}（id: {cfg.get('id')}）: {cfg.get('description', '')}\n"
     if not skill_list:
         skill_list = "  （暂无技能）\n"
 
-    return f"""你是野生动物调查项目的协调助手。数据分析任务由规划器（planner）负责制定工作流并交给数据分析子图执行，你负责：
+    return f"""你是生态环境调查项目的协调助手，支持陆生动物与陆生植物两类数据分析。数据分析任务由规划器（planner）负责
+制定工作流并交给对应领域的数据分析子图执行（动物→animal_date_analysis_agent，植物→plant_date_analysis_agent），你负责
+：
 
 1. 回答用户的一般性问题（结合检索资料回答；资料不足时使用自身知识，但不要编造数据分析结果）
 2. 用户要求查看目录/读取文件时，使用 parent_list_files / parent_read_file_content 工具
@@ -1649,6 +1680,7 @@ def _build_skill_catalog_text() -> str:
         lines.append(json.dumps({
             "name": cfg.get("name"),
             "id": cfg.get("id"),
+            "domain": cfg.get("_domain"),
             "type": cfg.get("type"),
             "description": cfg.get("description", ""),
             "parameters": cfg.get("parameters", {}),
@@ -1657,21 +1689,26 @@ def _build_skill_catalog_text() -> str:
     return "\n".join(lines)
 
 
-PLANNER_SYSTEM_PROMPT = """你是野生动物调查数据分析系统的"规划器"。根据用户输入，输出一个 JSON 决定如何执行。
+PLANNER_SYSTEM_PROMPT = """你是生态环境调查数据分析系统的"规划器"。根据用户输入，输出一个 JSON 决定如何执行。
 
-【可用的技能目录】（见用户消息）。规划时必须遵守：
-- use_skill 只能使用技能目录中的 id 或 name。
-- workflow_steps 每项形如：{"step": 1, "type": "skill", "use_skill": "<id>", "input_from": <依赖的上一步step编号>}；审核步骤：{"step": n, "type": "review", "description": "..."}。没有依赖时可省略 input_from。
+【可用的技能目录】（见用户消息，每行一个技能 JSON，domain 字段：animal=陆生动物，plant=陆生植物）。规划时必须遵守：
+- domain 字段：任务涉及动物数据时为 "animal"，涉及植物数据时为 "plant"。
+- use_skill 只能使用技能目录中的 id 或 name，且必须与 domain 匹配。
+- workflow_steps 每项形如：{"step": 1, "type": "skill", "use_skill": "<id>", "input_from": <依赖的上一步step编号>}；审
+核步骤：{"step": n, "type": "review", "description": "..."}。没有依赖时可省略 input_from。
 - 参数 parameters 从用户输入提取；用户未提供的键省略。
-- 用户说"全工作流/完整流程"时，复用目录中 type=workflow 的技能（如 full_animal_workflow）的 workflow_steps。
-- 用户说"已有动物列表/已完成列表"时，跳过"动物列表合并"，从"动物名录生成"开始。
-- 用户只要求单一技能（如"动物名录分析"）时，用 action=single_skill。
-- 无法确定工作流且缺少必要参数时，用 action=chat 交给协调助手向用户澄清；一般性问题（概念解释、闲聊、查看文件等）也用 action=chat。
+- 用户说"全工作流/完整流程"时，复用目录中 type=workflow 的技能（动物用 full_animal_workflow，植物用
+full_plant_workflow）的 workflow_steps。
+- 用户只要求单一技能时，用 action=single_skill。
+- 无法确定工作流且缺少必要参数时，用 action=chat 交给协调助手向用户澄清；一般性问题（概念解释、闲聊、查看文件等）也用
+action=chat。
 
 输出 JSON 三选一：
-{"action": "workflow", "task_name": "...", "mode": "workflow", "skill_id": "...", "parameters": {...}, "workflow_steps": [...]}
+{"action": "workflow", "domain": "animal"|"plant", "task_name": "...", "mode": "workflow", "skill_id": "...",
+"parameters": {...}, "workflow_steps": [...]}
 或
-{"action": "single_skill", "task_name": "...", "mode": "single_skill", "skill_id": "...", "parameters": {...}}
+{"action": "single_skill", "domain": "animal"|"plant", "task_name": "...", "mode": "single_skill", "skill_id": "...",
+"parameters": {...}}
 或
 {"action": "chat"}
 
@@ -1696,7 +1733,7 @@ def _parse_json_safely(content: str) -> Dict:
 
 # ---------- 父图节点函数 ----------
 
-def parent_retrieve_node(state: AgentState) -> Dict:
+def parent_retrieve_node(state: ParentState) -> Dict:
     """检索节点：从 SOP 向量数据库检索相关资料。"""
     user_message = ""
     for m in reversed(state.get("messages", [])):
@@ -1708,7 +1745,7 @@ def parent_retrieve_node(state: AgentState) -> Dict:
     return {"retrieved_docs": docs}
 
 
-def parent_planner_node(state: AgentState) -> Dict:
+def parent_planner_node(state: ParentState) -> Dict:
     """规划节点：LLM 根据用户输入 + 检索资料 + 技能目录，生成工作流计划。"""
     user_text = ""
     for m in reversed(state.get("messages", [])):
@@ -1735,14 +1772,15 @@ def parent_planner_node(state: AgentState) -> Dict:
     ])
     content = resp.content if hasattr(resp, 'content') else str(resp)
     plan = _parse_json_safely(content)
-    print(f"[DEBUG] parent_planner: 计划 action={plan.get('action')}, mode={plan.get('mode')}")
+    print(f"[DEBUG] parent_planner: 计划 action={plan.get('action')}, domain={plan.get('domain')},mode={plan.get('mode')}")
 
     if plan.get("action") in ("workflow", "single_skill"):
-        return {"parent_plan": plan, "parent_action": plan["action"]}
+        domain = plan.get("domain") or ("plant" if str(plan.get("skill_id", "")).startswith("plant_") else "animal")
+        return {"parent_plan": plan, "parent_action": plan["action"], "domain": domain}
     return {"parent_plan": {}, "parent_action": "chat"}
 
 
-def parent_planner_router(state: AgentState) -> str:
+def parent_planner_router(state: ParentState) -> str:
     if state.get("parent_action") in ("workflow", "single_skill"):
         return "dispatch"
     return "chat"
@@ -1759,9 +1797,15 @@ def _normalize_workflow_steps(steps: List[Dict]) -> List[Dict]:
     return clean
 
 
-def parent_dispatch_node(state: AgentState) -> Dict:
-    """分发节点：把规划结果转换为子图可直接执行的执行状态。"""
+def parent_dispatch_node(state: ParentState) -> Dict:
+    """分发节点：把规划结果转换为对应子图可直接执行的执行状态。"""
     plan = state.get("parent_plan") or {}
+    domain = plan.get("domain") or state.get("domain")
+    if domain not in ("animal", "plant"):
+        skill_id = plan.get("skill_id") or plan.get("skill_name") or ""
+        domain = "plant" if str(skill_id).startswith("plant_") else "animal"
+
+    registry = _registry_for_domain(domain)
     mode = plan.get("mode") or ("single_skill" if plan.get("action") == "single_skill" else "workflow")
     params = plan.get("parameters") or {}
     skill_id = plan.get("skill_id") or plan.get("skill_name")
@@ -1774,36 +1818,47 @@ def parent_dispatch_node(state: AgentState) -> Dict:
         "final_output": None,
         "error": None,
         "subgraph_delegated": True,
+        "domain": domain,
+        "skill_registry": registry,
     }
     for k in ("work_dir", "input_file", "history_file", "pa", "regional_level"):
         if k in params and params[k]:
             state_update[k] = params[k]
 
     if mode == "single_skill":
-        cfg, err = _load_full_skill(skill_id)
+        cfg, err = _load_full_skill_from(registry, skill_id)
         if cfg is None:
-            return {"messages": [SystemMessage(content=f"规划失败：{err}")], "parent_action": "chat", "subgraph_delegated": False}
+            return {
+                "messages": [SystemMessage(content=f"规划失败：{err}")],
+                "parent_action": "chat",
+                "subgraph_delegated": False
+            }
         state_update.update({
             "execution_mode": "single_skill",
             "selected_skill": cfg.get("name"),
             "skill_config": cfg,
             "workflow_steps": [],
         })
-        print(f"[DEBUG] parent_dispatch: 单技能 {cfg.get('name')}")
+        print(f"[DEBUG] parent_dispatch: 单技能 [{domain}] {cfg.get('name')}")
         return state_update
 
     # workflow 模式
     steps = _normalize_workflow_steps(plan.get("workflow_steps") or [])
     task_name = plan.get("task_name")
     if not steps:
-        cfg, _ = _load_full_skill(skill_id)
+        cfg, _ = _load_full_skill_from(registry, skill_id)
         if isinstance(cfg, dict) and cfg.get("workflow_steps"):
             steps = _normalize_workflow_steps(cfg["workflow_steps"])
             task_name = task_name or cfg.get("name")
     if not steps:
-        return {"messages": [SystemMessage(content="规划失败：缺少 workflow_steps，无法执行。")], "parent_action": "chat", "subgraph_delegated": False}
+        return {
+            "messages": [SystemMessage(content="规划失败：缺少 workflow_steps，无法执行。")],
+            "parent_action": "chat",
+            "subgraph_delegated": False
+        }
 
-    task_name = task_name or skill_id or "动物数据分析"
+    default_task = "陆生植物数据分析" if domain == "plant" else "陆生动物数据分析"
+    task_name = task_name or skill_id or default_task
     skill_config = {
         "name": task_name,
         "id": skill_id or "planned_workflow",
@@ -1811,7 +1866,7 @@ def parent_dispatch_node(state: AgentState) -> Dict:
         "type": "workflow",
         "parameters": {
             "work_dir": "工作目录路径", "input_file": "输入文件名",
-            "history_file": "历史资料文件名", "pa": "居留型起始标记", "regional_level": "省级保护级别"
+            "history_file": "历史资料文件名", "pa": "居留型起始标记（植物可忽略）", "regional_level": "省级保护级别"
         },
         "workflow_steps": steps,
     }
@@ -1821,17 +1876,17 @@ def parent_dispatch_node(state: AgentState) -> Dict:
         "skill_config": skill_config,
         "workflow_steps": steps,
     })
-    print(f"[DEBUG] parent_dispatch: 工作流 '{task_name}'，共 {len(steps)} 步")
+    print(f"[DEBUG] parent_dispatch: 工作流 [{domain}] '{task_name}'，共 {len(steps)} 步")
     return state_update
 
 
-def parent_dispatch_router(state: AgentState) -> str:
+def parent_dispatch_router(state: ParentState) -> str:
     if state.get("subgraph_delegated") is True:
-        return "subgraph"
+        return "animal_subgraph" if state.get("domain") == "animal" else "plant_subgraph"
     return "parent_chat"
 
 
-def parent_chat_node(state: AgentState):
+def parent_chat_node(state: ParentState):
     """父图聊天节点：回答一般问题 / 查看文件 / 汇报子图执行结果。"""
     docs = state.get("retrieved_docs") or []
     doc_block = ""
@@ -1850,22 +1905,32 @@ def parent_chat_node(state: AgentState):
     return {"messages": [response]}
 
 
-def parent_chat_router(state: AgentState) -> str:
+def parent_chat_router(state: ParentState) -> str:
     last_message = state["messages"][-1] if state["messages"] else None
     if isinstance(last_message, AIMessage) and getattr(last_message, 'tool_calls', None):
         return "tools"
     return "respond"
 
 
-def parent_plan_node(state: AgentState) -> Dict:
-    """子图执行完成后的反馈节点：格式化结果，交回 parent_chat 汇报。"""
+def parent_plan_node(state: ParentState) -> Dict:
+    """子图执行完成后的反馈节点：格式化结果，落到对应领域的命名空间结果字段。"""
+    domain = state.get("domain") or "animal"
+    result_key = f"{domain}_result"
     final_output = state.get("final_output")
+
+    # 结果写入各自的命名空间字段，互不覆盖
+    base_update = {
+        "execution_mode": "chat",
+        "subgraph_delegated": False,
+        "final_output": None,
+        result_key: final_output,
+    }
 
     if final_output:
         status = final_output.get("status", "unknown")
         skill_name = final_output.get("skill", "未知技能")
         if status == "completed":
-            msg = f"✅ 子图任务 '{skill_name}' 执行完成。\n"
+            msg = f"✅ {domain_label(domain)}子图任务 '{skill_name}' 执行完成。\n"
             if final_output.get("type") == "single":
                 for r in final_output.get("results", []):
                     msg += f"  - {r.get('description', r.get('script', ''))}\n"
@@ -1876,26 +1941,24 @@ def parent_plan_node(state: AgentState) -> Dict:
                         if files:
                             msg += f"  {key}: 输出文件 {files}\n"
         elif status == "error":
-            msg = f"❌ 子图任务 '{skill_name}' 执行出错：\n{final_output.get('error', '未知错误')}"
+            msg = f"❌ {domain_label(domain)}子图任务 '{skill_name}' 执行出错：\n{final_output.get('error', '未知错误')}"
         elif status == "aborted":
-            msg = f"⚠️ 子图任务 '{skill_name}' 已终止：{final_output.get('reason', '用户终止')}"
+            msg = f"⚠️ {domain_label(domain)}子图任务 '{skill_name}' 已终止：{final_output.get('reason', '用户终止')}"
         else:
-            msg = f"子图任务 '{skill_name}' 状态：{status}"
-        print(f"[DEBUG] parent_plan(feedback): {msg[:200]}")
-        return {
-            "execution_mode": "chat",
-            "messages": [SystemMessage(content=msg)],
-            "final_output": None,
-            "subgraph_delegated": False,
-        }
+            msg = f"{domain_label(domain)}子图任务 '{skill_name}' 状态：{status}"
+        print(f"[DEBUG] parent_plan({domain}): {msg[:200]}")
+        base_update["messages"] = [SystemMessage(content=msg)]
 
-    print("[DEBUG] parent_plan: 子图返回但无 final_output")
-    return {"execution_mode": "chat", "subgraph_delegated": False}
+    return base_update
+
+
+def domain_label(domain: Optional[str]) -> str:
+    return "陆生植物" if domain == "plant" else "陆生动物"
 
 
 # ---------- 构建父图 ----------
 
-parent_builder = StateGraph(AgentState)
+parent_builder = StateGraph(ParentState)
 
 parent_builder.add_node("parent_retrieve", parent_retrieve_node)
 parent_builder.add_node("parent_planner", parent_planner_node)
@@ -1903,7 +1966,8 @@ parent_builder.add_node("parent_dispatch", parent_dispatch_node)
 parent_builder.add_node("parent_chat", parent_chat_node)
 parent_builder.add_node("parent_tools", parent_tool_node)
 parent_builder.add_node("parent_plan", parent_plan_node)
-parent_builder.add_node("subgraph", animal_date_analysis_agent)
+parent_builder.add_node("animal_subgraph", animal_date_analysis_agent)
+parent_builder.add_node("plant_subgraph", plant_date_analysis_agent)
 
 parent_builder.add_edge(START, "parent_retrieve")
 parent_builder.add_edge("parent_retrieve", "parent_planner")
@@ -1914,7 +1978,8 @@ parent_builder.add_conditional_edges("parent_planner", parent_planner_router, {
 })
 
 parent_builder.add_conditional_edges("parent_dispatch", parent_dispatch_router, {
-    "subgraph": "subgraph",
+    "animal_subgraph": "animal_subgraph",
+    "plant_subgraph": "plant_subgraph",
     "parent_chat": "parent_chat",
 })
 
@@ -1924,7 +1989,8 @@ parent_builder.add_conditional_edges("parent_chat", parent_chat_router, {
 })
 
 parent_builder.add_edge("parent_tools", "parent_chat")
-parent_builder.add_edge("subgraph", "parent_plan")
+parent_builder.add_edge("animal_subgraph", "parent_plan")
+parent_builder.add_edge("plant_subgraph", "parent_plan")
 parent_builder.add_edge("parent_plan", "parent_chat")
 
 # 编译父图
@@ -1940,7 +2006,6 @@ def _print_last_ai_message(agent, config):
         if isinstance(msg, AIMessage) and msg.content:
             print(f"\n🤖 助手: {msg.content}")
             return
-    # 如果没有 AI 消息，检查 final_output
     final = state.values.get("final_output")
     if final:
         print(f"\n🤖 执行结果: {json.dumps(final, ensure_ascii=False, indent=2, default=str)}")
@@ -1986,11 +2051,9 @@ def _handle_interrupts(agent, config):
                     else:
                         print("无效输入，请选择: 通过 / 重新执行 / 终止")
 
-            # 恢复执行
             for _ in agent.stream(Command(resume=resume_value), config=config, stream_mode="values"):
                 pass
 
-            # 恢复后可能还有新的 interrupt，递归处理
             _handle_interrupts(agent, config)
             return
 
@@ -2001,8 +2064,9 @@ def run_interactive():
     config = {"configurable": {"thread_id": "interactive-1"}}
 
     print("=" * 60)
-    print("野生动物调查数据分析助手")
-    print("可用技能：", [s["name"] for s in skill_registry])
+    print("生态环境调查数据分析助手（陆生动物 + 陆生植物）")
+    print("动物技能：", [s["name"] for s in animal_skill_registry])
+    print("植物技能：", [s["name"] for s in plant_skill_registry])
     print("输入 'quit' 退出")
     print("=" * 60)
 
@@ -2014,18 +2078,15 @@ def run_interactive():
         if not user_input:
             continue
 
-        # 添加用户消息
         initial_state = {
             "messages": [HumanMessage(content=user_input)],
             "execution_mode": "chat",
         }
 
         try:
-            # stream 执行（interrupt 时图会自然暂停，不会抛异常）
             step_count = 0
             for event in parent_graph.stream(initial_state, config=config, stream_mode="values"):
                 step_count += 1
-                # 每个步骤打印当前消息流
                 msgs = event.get("messages", [])
                 if msgs:
                     latest = msgs[-1]
@@ -2045,10 +2106,7 @@ def run_interactive():
                     content = latest.content or ""
                     print(f"  [STEP {step_count}] {role}: {content}")
 
-            # 检查是否有 pending interrupt
             _handle_interrupts(parent_graph, config)
-
-            # 输出最后一条 AI 消息
             _print_last_ai_message(parent_graph, config)
 
         except Exception as e:
@@ -2057,4 +2115,3 @@ def run_interactive():
 
 if __name__ == "__main__":
     run_interactive()
-
