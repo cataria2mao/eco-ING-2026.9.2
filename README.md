@@ -309,7 +309,7 @@ parent_report → 汇总 plant_result 汇报
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek 兼容接口地址 |
 | `DASHSCOPE_API_KEY` | — | DashScope 向量化 API Key |
 | `EMBED_MODEL` | `text-embedding-v3` | 语义向量模型 |
-| `EMBED_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 向量化接口地址 |
+| `EMBED_BASE_URL` | - | 向量化接口地址 |
 | `SOP_DOCX_PATH` | `D:\PythonProject1\生态环境调查报告工作sop.docx` | SOP 知识库文档路径 |
 | `CHROMA_DIR` | 脚本目录下 `chroma_sop_db` | Chroma 向量库持久化目录 |
 
@@ -335,7 +335,7 @@ parent_report → 汇总 plant_result 汇报
 │   ├── alpha_analysis.json         #   alpha多样性分析（R）
 │   ├── Alpha_analysis.R
 │   ├── full_animal_workflow.json   #   全工作流编排
-│   └── 参考名录.xlsx               #   参考名录数据（请勿开源）
+│   └── 参考名录.xlsx               #   参考名录数据（示例数据，可用PostgreSQL数据库）
 ├── plant_skills/                   # 植物技能目录（待创建/验证，规划器与执行器已就绪）
 ├── chroma_sop_db/                  # Chroma 向量库（运行时生成）
 ├── requirements.txt                # Python 依赖
