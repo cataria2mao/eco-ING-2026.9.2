@@ -345,17 +345,6 @@ parent_report → 汇总 plant_result 汇报
 
 ---
 
-## 🔐 开源前注意事项
-
-1. **API Key**：`.env` 中的 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`LANGSMITH_API_KEY` 等属于敏感信息，**切勿提交**。
-2. **业务数据**：样线表、历史资料、`参考名录.xlsx` 等属于项目/公司业务数据，建议**不要开源**，仅保留空样例或脱敏数据。
-3. **本地运行产物**：`chroma_sop_db/`、`__pycache__/`、`.venv/`、`日志.docx`、`日志.md` 等运行时/日志文件不应入库。
-4. 建议首次提交前执行 `git rm -r --cached .env chroma_sop_db`（若已误提交）。
-
-仓库已附带 `.gitignore`，请按需调整。
-
----
-
 ## 📄 License
 
 （请根据你的需求选择，例如 MIT / Apache-2.0，并在仓库根目录添加 `LICENSE` 文件。）
