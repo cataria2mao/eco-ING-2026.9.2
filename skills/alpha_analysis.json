@@ -6,7 +6,7 @@
   "parameters": {
     "work_dir": "工作目录路径（必填）",
     "input_file": "动物样线表（必填），如：样线表.xlsx",
-    "groups_type": "分组依据（必填），可选”无“，”季节“，”地区“"
+    "groups_type": "分组依据（必填），选填”无“，”季节“，”地区“"
   },
   "workflow": [
     {

@@ -9,6 +9,7 @@ library(vegan)
 library(optparse)
 library(rvg)
 library(fs, warn.conflicts = FALSE)
+library(jsonlite)
 
 
 windowsFonts(SimSun=windowsFont("SimSun"))
@@ -99,7 +100,7 @@ if (groups_type == "季节") {
   
   # 添加一个幻灯片
   ppt <- add_slide(ppt, layout = "Title and Content", master = "Office Theme")
-  ppt <- ph_with(ppt, value = dml(ggobj = p1), location = ph_location_fullsize())
+  ppt <- ph_with(ppt, value = dml(ggobj = p), location = ph_location_fullsize())
   
   # 保存PPT文件
   output_ppt <- file.path(work_dir, "diversity_facet_plot.pptx")
@@ -150,10 +151,10 @@ if (groups_type == "季节") {
 
 write.csv(dyxD, file.path(work_dir, 'dyxb.csv'),fileEncoding = 'GB18030',row.names=F)
 
-summary <- paste0(
-  "【分析完成】\n",
-  "输出文件：\n",
-  "1. dyxb：", file.path(work_dir, "dyxb.csv"), "\n",
-  "2. 多样性图：", file.path(work_dir, "diversity_facet_plot.pptx"), "\n"
-)
-cat(summary)
+cat(toJSON(list(
+  status = "completed",
+  outputs = list(
+    dyxb   = file.path(work_dir, "dyxb.csv"),
+    ppt    = file.path(work_dir, "diversity_facet_plot.pptx")
+  )
+), auto_unbox = TRUE, pretty = TRUE))

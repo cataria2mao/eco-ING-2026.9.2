@@ -16,7 +16,7 @@
         "script_args": [
           "--work_dir", "{work_dir}",
           "--input_file", "{input_file}",
-          "--regional_level", "{province}"
+          "--regional_level", "{regional_level}"
         ]
       }
     }

@@ -8,7 +8,8 @@
     "input_file": "样线表文件名，如：样线表.xlsx",
     "history_file": "历史资料文件名，如：历史资料.xlsx",
     "pa": "居留型起始标记（可选，默认 ⅤA）",
-    "regional_level": "省级保护级别（可选）"
+    "regional_level": "省级保护级别（可选）",
+    "groups_type": "分组依据（必填），选填”无“，”季节“，”地区“"
   },
   "workflow_steps": [
     {"step": 1, "type": "skill", "use_skill": "动物列表合并", "review_point": false},
