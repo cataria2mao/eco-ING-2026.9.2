@@ -309,7 +309,7 @@ parent_report → 汇总 plant_result 汇报
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek 兼容接口地址 |
 | `DASHSCOPE_API_KEY` | — | DashScope 向量化 API Key |
 | `EMBED_MODEL` | `text-embedding-v3` | 语义向量模型 |
-| `EMBED_BASE_URL` | - | 向量化接口地址 |
+| `EMBED_BASE_URL` | `` | 向量化接口地址 |
 | `SOP_DOCX_PATH` | `D:\PythonProject1\生态环境调查报告工作sop.docx` | SOP 知识库文档路径 |
 | `CHROMA_DIR` | 脚本目录下 `chroma_sop_db` | Chroma 向量库持久化目录 |
 
@@ -347,7 +347,7 @@ parent_report → 汇总 plant_result 汇报
 
 ## 📄 License
 
-（请根据你的需求选择，例如 MIT / Apache-2.0，并在仓库根目录添加 `LICENSE` 文件。）
+GPL v3
 
 ---
 
