@@ -13,6 +13,7 @@
 """
 
 import os, json, subprocess, sys, re
+from docx import Document
 from pathlib import Path
 from typing import TypedDict, Optional, Any, List, Dict, Annotated
 
