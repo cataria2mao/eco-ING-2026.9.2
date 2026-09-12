@@ -9,7 +9,6 @@ library(vegan)
 library(optparse)
 library(rvg)
 library(fs, warn.conflicts = FALSE)
-library(jsonlite)
 
 
 windowsFonts(SimSun=windowsFont("SimSun"))
@@ -151,10 +150,6 @@ if (groups_type == "季节") {
 
 write.csv(dyxD, file.path(work_dir, 'dyxb.csv'),fileEncoding = 'GB18030',row.names=F)
 
-cat(toJSON(list(
-  status = "completed",
-  outputs = list(
-    dyxb   = file.path(work_dir, "dyxb.csv"),
-    ppt    = file.path(work_dir, "diversity_facet_plot.pptx")
-  )
-), auto_unbox = TRUE, pretty = TRUE))
+cat("\n---OUTPUTS---\n")
+cat(file.path(work_dir, "dyxb.csv"), "\n", sep = "")
+cat(file.path(work_dir, "diversity_facet_plot.pptx"), "\n", sep = "")

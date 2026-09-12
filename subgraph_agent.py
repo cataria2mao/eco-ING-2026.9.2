@@ -481,8 +481,6 @@ SUB_PLANNER_SYSTEM_PROMPT = """你是{domain_label}数据分析子图的"任务�
 - 用户只要求单一技能时，用 action=single_skill。
 - parameters 只填用户明确给出的参数（work_dir / input_file / history_file / pa / regional_level 等），
   用户未提供的键一律省略（脚本有默认值，不要编造文件路径）。
-  缺失的必填参数【不要在这里询问】，系统会在执行脚本前统一询问用户
-  “提供参数还是使用脚本默认参数”。
 - 无法确定要执行什么技能，或用户输入属于一般问答/闲聊（非数据分析任务）时，
   输出 {{"action": "chat", "reason": "需要向用户澄清/说明的内容"}}；
   仅缺少参数不构成 chat 的理由。

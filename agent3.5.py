@@ -30,8 +30,9 @@ from subgraph_agent import (
 # 架构说明（agent3.5）
 # ------------------------------------------------------------
 # 1. 父图【不承担“规划器”功能】。父图只负责：
-#      混合检索 SOP 向量数据库 → 判断用户请求归属（动物任务/植物任务/直接问答）
-#      → 将【原始用户输入原样】转发给对应子图 → 接收子图结果并向用户汇报。
+#      接收用户消息 → 【需求判断】（动物任务 / 植物任务 / 知识问答）
+#      → 数据分析/报告任务：将【原始用户输入原样】转发给对应子图 → 接收子图结果汇报；
+#      → 知识问答：从多个知识库中选择最匹配的一个做混合检索 → 基于检索资料简述回答。
 # 2. 建立两个领域子图（base work agent）：
 #      animal_base_work_agent（动物，状态 AnimalAnalysisState）
 #      plant_base_work_agent  （植物，状态 PlantAnalysisState）
@@ -54,12 +55,13 @@ class ParentState(TypedDict):
     """父图状态：只有对话 + 检索 + 路由 + 结果桥接，不含任何子图执行字段。"""
     messages: Annotated[list, add_messages]
 
-    # 混合检索结果
-    retrieved_docs: Optional[List[str]]
-
-    # 路由判断结果（不规划任何执行细节）
+    # 需求判断结果（不规划任何执行细节）
     route: Optional[str]          # "animal" | "plant" | "chat"
     route_reason: Optional[str]
+    kb: Optional[str]             # route=chat 时选定的知识库 key；"none" 表示无需检索
+
+    # 知识库检索结果（来自选定的知识库）
+    retrieved_docs: Optional[List[str]]
 
     # 桥接通道：分发任务 / 收取结果（对应两个子图，互不干扰）
     animal_request: Optional[str]
@@ -117,7 +119,7 @@ print("[GRAPH] animal_base_work_agent / plant_base_work_agent 已编译")
 
 
 # ============================================================
-# 父图：混合检索 + 路由判断（不规划） + 结果汇报
+# 父图：需求判断（不规划）→ 分发子图 或 检索知识库 → 结果汇报
 # ============================================================
 
 SOP_DOCX_PATH = os.getenv("SOP_DOCX_PATH", r"D:\PythonProject1\生态环境调查报告工作sop.docx")
@@ -125,6 +127,39 @@ CHROMA_DIR = os.getenv("CHROMA_DIR", str(Path(__file__).resolve().parent / "chro
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v3")
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 EMBED_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+
+
+# ========== 多知识库（多向量数据库）注册表 ==========
+# 父图先判断用户需求：
+#   - 数据分析/报告任务 → 分发给对应子图（animal / plant）；
+#   - 知识问答/科普 → 从下列知识库中选择最匹配的一个进行混合检索并简述回答。
+# 每个知识库独立使用一个 chromadb 持久化目录 + collection，并缓存 chunks 供 BM25 使用。
+KNOWLEDGE_BASES: Dict[str, Dict[str, Any]] = {
+    "sop": {
+        "label": "生态环境调查 SOP",
+        "description": "生态环境调查工作方案、调查流程、报告撰写规范等",
+        "chroma_dir": CHROMA_DIR,
+        "collection": "sop_semantic",
+        "chunks_file": "sop_chunks.json",
+    },
+    # 预留：按需新增其它向量数据库，路由会自动识别（无需改图结构）
+    # "species": {
+    #     "label": "物种知识库",
+    #     "description": "陆生动物/植物物种名录、保护级别、居留型、生活习性等",
+    #     "chroma_dir": str(Path(__file__).resolve().parent / "chroma_species_db"),
+    #     "collection": "species_semantic",
+    #     "chunks_file": "species_chunks.json",
+    # },
+}
+DEFAULT_KB = "sop"
+
+
+def _kb_catalog_text() -> str:
+    """知识库目录文本（供需求判断节点选择）。"""
+    lines = []
+    for key, cfg in KNOWLEDGE_BASES.items():
+        lines.append(f'- "{key}"：{cfg.get("label", key)}（{cfg.get("description", "")}）')
+    return "\n".join(lines) or "（暂无知识库）"
 
 
 class _DashScopeEmbeddingFunction:
@@ -227,62 +262,73 @@ def _rrf_fuse(rank_lists: List[List[int]], k: int = 60) -> List[int]:
     return sorted(scores, key=lambda i: scores[i], reverse=True)
 
 
-_sop_chunks_cache = None
-_semantic_store = None
-_keyword_index = None
+_kb_chunks_cache: Dict[str, List[str]] = {}
+_kb_semantic_store: Dict[str, Any] = {}
+_kb_keyword_index: Dict[str, Any] = {}
 
 
-def _load_chunks() -> List[str]:
-    global _sop_chunks_cache
-    if _sop_chunks_cache is None:
-        cache_file = Path(CHROMA_DIR) / "sop_chunks.json"
-        if cache_file.exists():
-            with open(cache_file, "r", encoding="utf-8") as f:
-                _sop_chunks_cache = json.load(f)
-        else:
-            try:
-                import chromadb
-                client = chromadb.PersistentClient(path=CHROMA_DIR)
-                coll = client.get_collection("sop_semantic")
-                data = coll.get(include=["documents"])
-                _sop_chunks_cache = data.get("documents", []) or []
-            except Exception as e:
-                print(f"[VEC] 无法加载 chunks: {e}")
-                _sop_chunks_cache = []
-    return _sop_chunks_cache
+def _kb_config(kb: str) -> Optional[Dict[str, Any]]:
+    return KNOWLEDGE_BASES.get(kb)
 
 
-def _get_retrievers():
-    global _semantic_store, _keyword_index
-
-    chunks = _load_chunks()
-
-    if _keyword_index is None:
-        _keyword_index = _BM25KeywordIndex(chunks)
-
-    if _semantic_store is None:
+def _load_chunks(kb: str = DEFAULT_KB) -> List[str]:
+    """加载指定知识库的文本块（优先读缓存文件，否则从 chromadb 读取）。"""
+    if kb in _kb_chunks_cache:
+        return _kb_chunks_cache[kb]
+    cfg = _kb_config(kb)
+    if not cfg:
+        print(f"[VEC] 未知知识库: {kb}")
+        return []
+    chroma_dir = cfg.get("chroma_dir", CHROMA_DIR)
+    chunks: List[str] = []
+    cache_file = Path(chroma_dir) / cfg.get("chunks_file", "chunks.json")
+    if cache_file.exists():
+        with open(cache_file, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+    else:
         try:
             import chromadb
-            client = chromadb.PersistentClient(path=CHROMA_DIR)
+            client = chromadb.PersistentClient(path=chroma_dir)
+            coll = client.get_collection(cfg.get("collection", "sop_semantic"))
+            data = coll.get(include=["documents"])
+            chunks = data.get("documents", []) or []
+        except Exception as e:
+            print(f"[VEC] 无法加载知识库[{kb}] chunks: {e}")
+            chunks = []
+    _kb_chunks_cache[kb] = chunks
+    return chunks
 
-            _semantic_store = client.get_collection(
-                name="sop_semantic",
+
+def _get_retrievers(kb: str = DEFAULT_KB):
+    """获取指定知识库的语义检索器与关键词检索器（惰性初始化，按知识库隔离）。"""
+    chunks = _load_chunks(kb)
+    cfg = _kb_config(kb) or {}
+
+    if kb not in _kb_keyword_index:
+        _kb_keyword_index[kb] = _BM25KeywordIndex(chunks)
+
+    if kb not in _kb_semantic_store:
+        try:
+            import chromadb
+            client = chromadb.PersistentClient(path=cfg.get("chroma_dir", CHROMA_DIR))
+            _kb_semantic_store[kb] = client.get_collection(
+                name=cfg.get("collection", "sop_semantic"),
                 embedding_function=_DashScopeEmbeddingFunction(),
             )
-            print(f"[VEC] 已加载已有语义索引（{len(chunks)} 块）")
+            print(f"[VEC] 已加载知识库[{kb}]语义索引（{len(chunks)} 块）")
         except Exception as e:
-            print(f"[VEC] 加载语义索引失败，仅使用关键词检索: {e}")
-            _semantic_store = None
+            print(f"[VEC] 知识库[{kb}]语义索引加载失败，仅使用关键词检索: {e}")
+            _kb_semantic_store[kb] = None
 
-    return _semantic_store, _keyword_index
+    return _kb_semantic_store[kb], _kb_keyword_index[kb]
 
 
-def retrieve_sop_chunks(query: str, k: int = 5) -> List[str]:
-    """混合检索：语义（DashScope text-embedding）+ 关键词（BM25），RRF 融合。"""
-    chunks = _load_chunks()
+def retrieve_kb_chunks(kb: str, query: str, k: int = 5) -> List[str]:
+    """在指定知识库中混合检索：语义（DashScope）+ 关键词（BM25），RRF 融合。"""
+    chunks = _load_chunks(kb)
     if not chunks:
         return []
-    sem, kw = _get_retrievers()
+    sem, kw = _get_retrievers(kb)
     idx_of = {c: i for i, c in enumerate(chunks)}
     n = max(k, 3)
 
@@ -295,7 +341,7 @@ def retrieve_sop_chunks(query: str, k: int = 5) -> List[str]:
                 if i is not None and i not in sem_rank:
                     sem_rank.append(i)
         except Exception as e:
-            print(f"[VEC] 语义检索失败: {e}")
+            print(f"[VEC] 知识库[{kb}]语义检索失败: {e}")
 
     kw_rank = kw.search(query, n)
     fused = _rrf_fuse([sem_rank, kw_rank])
@@ -339,31 +385,37 @@ parent_tool_node = ToolNode(parent_tools)
 parent_llm_with_tools = parent_llm.bind_tools(parent_tools)
 
 
-# ---------- 路由系统提示（只分类，不规划） ----------
-PARENT_ROUTER_SYSTEM_PROMPT = """你是生态环境调查系统的"任务路由"，只负责把用户请求分发给对应处理方，【不做任何执行规划】。
+# ---------- 需求判断系统提示（先判需求，再选处理方式） ----------
+PARENT_ROUTER_SYSTEM_PROMPT = """你是生态环境调查系统的"需求判断与任务路由"，只负责判断用户需求并决定处理方式，【不做任何执行规划】。
 
-根据【用户输入】与【混合检索命中的资料】输出 JSON：
-{"route": "animal" | "plant" | "chat", "reason": "..."}
+请先判断用户需求，再输出 JSON：
+{"route": "animal" | "plant" | "chat", "kb": "<知识库key或none>", "reason": "..."}
 
-判定规则：
+route 判定：
 - "animal"：用户要求的是【动物类数据分析/报告撰写/名录处理任务】（涉及动物调查数据文件，如鸟类/兽类/两栖爬行监测样线、动物名录、居留型、动物多样性统计、动物报告撰写等，需要执行数据分析脚本完成任务）。
 - "plant"：同理，植物类数据分析/报告撰写任务。
 - "chat"：一般知识问答（例如询问某个物种的生活习性、生态学概念解释）、闲聊、查看文件、与数据分析脚本执行无关的请求。
 
-注意：
-1. 询问物种习性、科普知识等即使提到动物/植物名，也归入 "chat"（由父图根据检索资料直接回答）。
-2. 只有"需要处理数据文件并执行分析/报告任务"的请求才路由给子图（animal/plant）。
-3. 检索命中情况只能作为参考；即使数据库未命中，只要用户请求明显是动物/植物数据分析任务，仍按任务路由。
+kb 判定（仅 route=chat 时有效）：
+- 若问题需要知识库资料支撑，从下列可用知识库中选择最匹配的一个，kb 填其 key；
+- 闲聊、问候、查看目录/文件等无需检索，kb 填 "none"；
+- route=animal/plant 时 kb 一律填 "none"。
 
-只输出 JSON，不要输出其他文字。"""
+可用知识库：
+{kb_catalog}
+
+注意：
+1. 询问物种习性、科普知识等即使提到动物/植物名，也归入 "chat"，并选择相应知识库。
+2. 只有"需要处理数据文件并执行分析/报告任务"的请求才路由给子图（animal/plant）。
+3. 只输出 JSON，不要输出其他文字。"""
 
 
 # ---------- 父图汇报/问答系统提示 ----------
 PARENT_SYSTEM_PROMPT = """你是生态环境调查（陆生动物 / 陆生植物）项目的协调助手。不负责规划与执行：数据分析、报告撰写任务会原样转交给对应的领域子图（animal_base_work_agent / plant_base_work_agent）去规划并执行。你负责：
 
 1. 一般问答：
-   - 若混合检索命中了与问题相关的资料，请【基于检索资料回答】，并可简要说明资料要点；
-   - 若检索未命中任何相关内容，而问题需要专业知识/资料支撑（如询问某物种的生活习性、特定方法细节、数据库收录内容等），请明确告知用户"当前数据库暂未收录相关内容"，不要编造答案；
+   - 若检索命中了与问题相关的知识库资料，请【基于检索资料简要回答】，并可简要说明资料要点及来源知识库；
+   - 若所选知识库未命中任何相关内容，而问题需要专业知识/资料支撑（如询问某物种的生活习性、特定方法细节、知识库收录内容等），请明确告知用户"当前知识库暂未收录相关内容"，不要编造答案；
    - 寒暄、闲聊可以正常回应。
 
 2. 用户要求查看目录/读取文件时，使用 parent_list_files / parent_read_file_content 工具。
@@ -382,46 +434,54 @@ def _get_last_human_text(state) -> str:
 
 # ---------- 父图节点 ----------
 
-def parent_retrieve_node(state: ParentState) -> Dict:
-    """检索节点：混合检索 SOP 向量数据库（返回"无"或相关内容）。"""
-    user_message = _get_last_human_text(state)
-    docs = retrieve_sop_chunks(user_message, k=5)
-    print(f"[DEBUG] parent_retrieve: 检索到 {len(docs)} 条资料" + ("" if docs else "（无）"))
-    return {"retrieved_docs": docs}
-
-
 def parent_router_node(state: ParentState) -> Dict:
-    """路由节点：判断任务归属 animal / plant / chat（不规划执行细节）。"""
+    """需求判断节点：先判断用户需求，再决定【分发子图】或【检索知识库】。"""
     user_text = _get_last_human_text(state)
-    docs = state.get("retrieved_docs") or []
-    doc_text = "\n\n".join(f"[资料{i + 1}] {d[:400]}" for i, d in enumerate(docs)) or "（无）"
-
-    user_prompt = f"""检索到的 SOP 相关资料：
-{doc_text}
-
-用户输入：
-{user_text}
-
-请输出 JSON："""
+    system_prompt = PARENT_ROUTER_SYSTEM_PROMPT.replace("{kb_catalog}", _kb_catalog_text())
 
     resp = parent_llm.invoke([
-        SystemMessage(content=PARENT_ROUTER_SYSTEM_PROMPT),
-        HumanMessage(content=user_prompt),
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"用户输入：\n{user_text}\n\n请输出 JSON："),
     ])
     content = resp.content if hasattr(resp, 'content') else str(resp)
     decision = _parse_json_safely(content)
+
     route = decision.get("route")
     if route not in ("animal", "plant"):
         route = "chat"
-    print(f"[DEBUG] parent_router: route={route}, reason={decision.get('reason', '')}")
-    return {"route": route, "route_reason": decision.get("reason", "")}
+
+    kb = decision.get("kb")
+    if route in ("animal", "plant") or kb not in KNOWLEDGE_BASES:
+        kb = "none"
+
+    print(f"[DEBUG] parent_router: route={route}, kb={kb}, reason={decision.get('reason', '')}")
+    return {
+        "route": route,
+        "route_reason": decision.get("reason", ""),
+        "kb": kb,
+        "retrieved_docs": [],   # 清空上一轮检索结果，避免串味
+    }
 
 
 def parent_router_router(state: ParentState) -> str:
-    """路由后走向：任务→分发；问答→直接回答。"""
+    """需求判断后走向：数据分析→分发子图；知识问答→检索所选知识库；其余→直接回答。"""
     if state.get("route") in ("animal", "plant"):
         return "dispatch"
+    if state.get("kb") in KNOWLEDGE_BASES:
+        return "retrieve"
     return "chat"
+
+
+def parent_retrieve_node(state: ParentState) -> Dict:
+    """检索节点：在需求判断选定的知识库中做混合检索。"""
+    kb = state.get("kb") or "none"
+    user_message = _get_last_human_text(state)
+    if kb not in KNOWLEDGE_BASES:
+        return {"retrieved_docs": []}
+    docs = retrieve_kb_chunks(kb, user_message, k=5)
+    label = KNOWLEDGE_BASES[kb].get("label", kb)
+    print(f"[DEBUG] parent_retrieve: 知识库[{kb}/{label}] 检索到 {len(docs)} 条资料" + ("" if docs else "（无）"))
+    return {"retrieved_docs": docs}
 
 
 def parent_dispatch_node(state: ParentState) -> Dict:
@@ -501,6 +561,7 @@ def parent_report_node(state: ParentState) -> Dict:
         "animal_request": "",
         "plant_request": "",
         "route": "chat",   # 本次委派结束，路由复位
+        "kb": "none",      # 清空知识库选择
     }
     # 注意：animal_result / plant_result 保留在父图状态中，供后续查看/汇报使用；
     # 下一次委派时 parent_dispatch_node 会先将其清空，因此不会串味。
@@ -512,11 +573,16 @@ def parent_report_node(state: ParentState) -> Dict:
 def parent_chat_node(state: ParentState):
     """父图聊天节点：回答一般问题 / 查看文件 / 汇报子图执行结果。"""
     docs = state.get("retrieved_docs") or []
-    doc_block = ""
+    kb = state.get("kb")
+    kb_label = KNOWLEDGE_BASES.get(kb, {}).get("label", "") if kb else ""
     if docs:
-        doc_block = "\n\n检索到的相关资料：\n" + "\n\n".join(f"[资料{i + 1}] {d[:800]}" for i, d in enumerate(docs))
+        source = f"（来源知识库：{kb_label}）" if kb_label else ""
+        doc_block = f"\n\n检索到的相关资料{source}：\n" + "\n\n".join(
+            f"[资料{i + 1}] {d[:800]}" for i, d in enumerate(docs))
+    elif kb_label:
+        doc_block = f"\n\n检索到的相关资料（来源知识库：{kb_label}）：（无）"
     else:
-        doc_block = "\n\n检索到的相关资料：（无）"
+        doc_block = ""
     messages = [SystemMessage(content=PARENT_SYSTEM_PROMPT + doc_block)] + state["messages"]
     response = parent_llm_with_tools.invoke(messages)
 
@@ -550,15 +616,18 @@ parent_builder.add_node("parent_tools", parent_tool_node)
 parent_builder.add_node("animal_base_work_agent", animal_base_work_agent)
 parent_builder.add_node("plant_base_work_agent", plant_base_work_agent)
 
-# 检索 → 路由
-parent_builder.add_edge(START, "parent_retrieve")
-parent_builder.add_edge("parent_retrieve", "parent_router")
+# 需求判断（入口）
+parent_builder.add_edge(START, "parent_router")
 
-# 路由 → 分发 或 直接问答
+# 需求判断 → 分发子图 / 检索知识库 / 直接回答
 parent_builder.add_conditional_edges("parent_router", parent_router_router, {
     "dispatch": "parent_dispatch",
+    "retrieve": "parent_retrieve",
     "chat": "parent_chat",
 })
+
+# 知识库检索 → 对话层简述回答
+parent_builder.add_edge("parent_retrieve", "parent_chat")
 
 # 分发 → 对应子图（一次只委派一个领域）
 parent_builder.add_conditional_edges("parent_dispatch", parent_dispatch_router, {
@@ -581,7 +650,7 @@ parent_builder.add_edge("parent_tools", "parent_chat")
 
 parent_graph = parent_builder.compile(checkpointer=checkpointer)
 
-print("[GRAPH] 父图已编译：检索 → 路由 → (animal/plant 子图或直接问答) → 汇报")
+print("[GRAPH] 父图已编译：需求判断 → (animal/plant 子图 或 知识库检索) → 汇报")
 
 
 # ========== 主入口测试 ==========
@@ -679,7 +748,7 @@ def run_interactive():
 
     print("=" * 60)
     print("生态环境调查数据分析助手（agent3.5）")
-    print("父图：混合检索 + 路由（不规划）")
+    print("父图：需求判断 → (分发子图 / 检索知识库) → 汇报")
     print("子图：animal_base_work_agent（动物）/ plant_base_work_agent（植物），内含任务规划器")
     print("动物技能：", [s["name"] for s in animal_skill_registry])
     print("植物技能：", [s["name"] for s in plant_skill_registry])
