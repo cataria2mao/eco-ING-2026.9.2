@@ -4,7 +4,7 @@ from typing import TypedDict, Optional, Any, List, Dict, Annotated
 from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+from langgraph.graph.message import add_messages, RemoveMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, Interrupt
 from langgraph.checkpoint.memory import MemorySaver
@@ -543,18 +543,63 @@ def _format_domain_result(domain: str, domain_label: str, result: Optional[Dict]
     return msg
 
 
+def _is_subgraph_report_message(msg) -> bool:
+    """判断是否为本图生成的子图汇报 SystemMessage。"""
+    if not isinstance(msg, SystemMessage):
+        return False
+    text = str(msg.content)
+    return "子图" in text and any(mark in text for mark in ("✅", "❌", "⚠️", "❓"))
+
+
+def _find_duplicate_report_ids(messages, content: str) -> List[str]:
+    """找出历史消息中与 content 完全相同的子图汇报的 message id。"""
+    ids: List[str] = []
+    for m in (messages or []):
+        if isinstance(m, SystemMessage) and str(m.content) == content:
+            mid = getattr(m, "id", None)
+            if mid:
+                ids.append(mid)
+    return ids
+
+
+def _dedupe_report_messages(messages: list) -> list:
+    """子图汇报去重：内容相同的重复汇报只保留最后一条。
+
+    用于传给 LLM / 前端防御性去重（兼容旧 checkpoint 或并发写入产生的重复）。
+    """
+    last_index: Dict[str, int] = {}
+    for i, m in enumerate(messages):
+        if _is_subgraph_report_message(m):
+            last_index[str(m.content)] = i
+    return [
+        m for i, m in enumerate(messages)
+        if not _is_subgraph_report_message(m) or last_index.get(str(m.content)) == i
+    ]
+
+
 def parent_report_node(state: ParentState) -> Dict:
-    """汇合节点：子图执行完成后，汇总 animal_result / plant_result 并交回对话层汇报。"""
+    """汇合节点：子图执行完成后，汇总 animal_result / plant_result 并交回对话层汇报。
+
+    消息去重：同一份汇报内容（例如用户连续两轮触发同一子图且结果一致）不会重复累积。
+    先移除历史中内容相同的旧汇报，再在本轮末尾追加一条，保证状态里只保留最新的一条。
+    """
     msgs = []
+    history = state.get("messages", [])
     if state.get("animal_result"):
         txt = _format_domain_result("animal", "陆生动物", state["animal_result"])
         if txt:
             print(f"[DEBUG] parent_report(animal): {txt[:200]}")
+            for mid in _find_duplicate_report_ids(history, txt):
+                print(f"[DEBUG] parent_report(animal): 移除重复汇报 message id={mid}")
+                msgs.append(RemoveMessage(id=mid))
             msgs.append(SystemMessage(content=txt))
     if state.get("plant_result"):
         txt = _format_domain_result("plant", "陆生植物", state["plant_result"])
         if txt:
             print(f"[DEBUG] parent_report(plant): {txt[:200]}")
+            for mid in _find_duplicate_report_ids(history, txt):
+                print(f"[DEBUG] parent_report(plant): 移除重复汇报 message id={mid}")
+                msgs.append(RemoveMessage(id=mid))
             msgs.append(SystemMessage(content=txt))
 
     update: Dict = {
@@ -583,7 +628,7 @@ def parent_chat_node(state: ParentState):
         doc_block = f"\n\n检索到的相关资料（来源知识库：{kb_label}）：（无）"
     else:
         doc_block = ""
-    messages = [SystemMessage(content=PARENT_SYSTEM_PROMPT + doc_block)] + state["messages"]
+    messages = [SystemMessage(content=PARENT_SYSTEM_PROMPT + doc_block)] + _dedupe_report_messages(state["messages"])
     response = parent_llm_with_tools.invoke(messages)
 
     if hasattr(response, 'tool_calls') and response.tool_calls:
@@ -596,9 +641,12 @@ def parent_chat_node(state: ParentState):
     return {"messages": [response]}
 
 
-def parent_chat_router(state: ParentState) -> str:
-    last_message = state["messages"][-1] if state["messages"] else None
-    if isinstance(last_message, AIMessage) and getattr(last_message, 'tool_calls', None):
+def parent_chat_router(state):
+    last = state["messages"][-1] if state["messages"] else None
+    if isinstance(last, AIMessage) and last.tool_calls:
+        tool_rounds = sum(1 for m in state["messages"] if isinstance(m, ToolMessage))
+        if tool_rounds >= 3:
+            return "respond"   # 强制结束
         return "tools"
     return "respond"
 
