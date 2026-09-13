@@ -1,7 +1,9 @@
-import os, json, re, math
+import os, json, re, math, threading, torch
+from dotenv import load_dotenv
 from pathlib import Path
 from typing import TypedDict, Optional, Any, List, Dict, Annotated
-from dotenv import load_dotenv
+from FlagEmbedding import FlagReranker
+from functools import lru_cache
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages, RemoveMessage
@@ -323,14 +325,71 @@ def _get_retrievers(kb: str = DEFAULT_KB):
     return _kb_semantic_store[kb], _kb_keyword_index[kb]
 
 
-def retrieve_kb_chunks(kb: str, query: str, k: int = 5) -> List[str]:
-    """在指定知识库中混合检索：语义（DashScope）+ 关键词（BM25），RRF 融合。"""
+_reranker = None
+_reranker_lock = threading.Lock()
+_RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") == "1"
+
+
+def _get_reranker():
+    """惰性加载 BGE-Reranker-v2-m3，显存较低友好配置。"""
+    global _reranker
+    if _reranker is not None:
+        return _reranker
+    with _reranker_lock:
+        if _reranker is not None:
+            return _reranker
+        try:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            _reranker = FlagReranker(
+                "BAAI/bge-reranker-v2-m3",
+                use_fp16=(device == "cuda"),   # CPU 上 FP16 反而更慢
+                devices=device,
+                # 关键：限制单次最大 batch，避免显存 OOM
+                query_max_length=512,
+                passage_max_length=512,
+            )
+            print(f"[RERANK] BGE-Reranker-v2-m3 已加载 (device={device}, fp16={device=='cuda'})")
+            if device == "cuda":
+                free, total = torch.cuda.mem_get_info()
+                print(f"[RERANK] 显存占用: {(total-free)/1024**3:.2f} GB / {total/1024**3:.2f} GB")
+        except Exception as e:
+            print(f"[RERANK] 加载失败，将退化为纯 RRF 检索: {e}")
+            _reranker = None
+    return _reranker
+
+
+@lru_cache(maxsize=256)
+def _cached_rerank(query: str, doc_tuple: tuple):
+    """对 (query, 文档元组) 做缓存，文档元组用于做 key。"""
+    reranker = _get_reranker()
+    if reranker is None:
+        return list(range(len(doc_tuple)))  # 退化：保持原序
+    pairs = [[query, d] for d in doc_tuple]
+    scores = reranker.compute_score(pairs, normalize=True, batch_size=8)
+    if not isinstance(scores, list):
+        scores = [scores]
+    return sorted(range(len(doc_tuple)), key=lambda i: scores[i], reverse=True)
+
+
+def retrieve_kb_chunks(kb: str, query: str, k: int = 5,
+                       rerank_top_k: int = 15) -> List[str]:
+    """在指定知识库中混合检索：语义（DashScope）+ 关键词（BM25）→ RRF 融合 → BGE 精排。
+
+    Args:
+        kb:              知识库 key
+        query:           用户查询
+        k:               最终返回的文档数（送入 LLM 的上下文）
+        rerank_top_k:    送入重排序的候选数（需 > k），6GB 显存建议 15-25
+    """
     chunks = _load_chunks(kb)
     if not chunks:
         return []
+
     sem, kw = _get_retrievers(kb)
     idx_of = {c: i for i, c in enumerate(chunks)}
-    n = max(k, 3)
+
+    # 召回阶段：取比最终结果更多的候选（rerank_top_k）
+    n = max(rerank_top_k, k, 3)
 
     sem_rank: List[int] = []
     if sem is not None:
@@ -345,7 +404,28 @@ def retrieve_kb_chunks(kb: str, query: str, k: int = 5) -> List[str]:
 
     kw_rank = kw.search(query, n)
     fused = _rrf_fuse([sem_rank, kw_rank])
-    return [chunks[i] for i in fused[:k]]
+    candidates = [chunks[i] for i in fused[:rerank_top_k]]
+
+    # 若重排序不可用或候选太少，直接返回 RRF 结果
+    if not _RERANK_ENABLED or len(candidates) <= k:
+        return candidates[:k]
+
+    reranker = _get_reranker()
+    if reranker is None:
+        return candidates[:k]
+
+    # 精排阶段：批量打分（内部按 batch 自动切分）
+    try:
+        order = _cached_rerank(query, tuple(candidates))
+        return [candidates[i] for i in order[:k]]
+
+    except torch.cuda.OutOfMemoryError:
+        print("[RERANK] CUDA OOM，清空缓存并退化为 RRF 结果")
+        torch.cuda.empty_cache()
+        return candidates[:k]
+    except Exception as e:
+        print(f"[RERANK] 打分失败，退化为 RRF 结果: {e}")
+        return candidates[:k]
 
 
 # ========== 父图 LLM 与工具 ==========
@@ -478,7 +558,7 @@ def parent_retrieve_node(state: ParentState) -> Dict:
     user_message = _get_last_human_text(state)
     if kb not in KNOWLEDGE_BASES:
         return {"retrieved_docs": []}
-    docs = retrieve_kb_chunks(kb, user_message, k=5)
+    docs = retrieve_kb_chunks(kb, user_message, k=5, rerank_top_k=15)
     label = KNOWLEDGE_BASES[kb].get("label", kb)
     print(f"[DEBUG] parent_retrieve: 知识库[{kb}/{label}] 检索到 {len(docs)} 条资料" + ("" if docs else "（无）"))
     return {"retrieved_docs": docs}
