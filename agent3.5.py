@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TypedDict, Optional, Any, List, Dict, Annotated
 from FlagEmbedding import FlagReranker
 from functools import lru_cache
+from huggingface_hub import InferenceClient
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages, RemoveMessage
@@ -15,8 +16,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage, HumanMessage
 from langchain_deepseek import ChatDeepSeek
 
-# 子图实现（动物 / 植物 base work agent、技能发现、脚本执行工具等）
-# 已拆分到 subgraph_agent.py，便于独立维护与更新
+# 子图
 from subgraph_agent import (
     AnimalAnalysisState,
     PlantAnalysisState,
@@ -28,45 +28,18 @@ from subgraph_agent import (
 )
 
 
-
-# ============================================================
-# 架构说明（agent3.5）
-# ------------------------------------------------------------
-# 1. 父图【不承担“规划器”功能】。父图只负责：
-#      接收用户消息 → 【需求判断】（动物任务 / 植物任务 / 知识问答）
-#      → 数据分析/报告任务：将【原始用户输入原样】转发给对应子图 → 接收子图结果汇报；
-#      → 知识问答：从多个知识库中选择最匹配的一个做混合检索 → 基于检索资料简述回答。
-# 2. 建立两个领域子图（base work agent）：
-#      animal_base_work_agent（动物，状态 AnimalAnalysisState）
-#      plant_base_work_agent  （植物，状态 PlantAnalysisState）
-#    规划器下沉到子图：子图收到任务后，先由【任务规划器】根据用户输入 + 本子图
-#    技能目录输出一个 JSON 决定如何执行（workflow / single_skill / chat）。
-# 3. 状态分离：
-#      - 子图内部执行字段（execution_mode / workflow_steps / step_outputs ...）
-#        与父图完全隔离（父图状态里没有这些键，子图内部通道写在各自 checkpoint
-#        命名空间下）。两个子图的内部字段命名一致（“命名空间可以相同”），因为
-#        它们各自独立编译、命名空间隔离，互不干扰。
-#      - 父图与子图之间只通过“桥接通道”交换最小信息：
-#            animal_request / animal_result  （动物）
-#            plant_request  / plant_result   （植物）
-#        因此 animal_base_work_agent 的结果落在 animal_result，
-#        plant_base_work_agent 的结果落在 plant_result，互不覆盖。
-# ============================================================
-
-
 class ParentState(TypedDict):
-    """父图状态：只有对话 + 检索 + 路由 + 结果桥接，不含任何子图执行字段。"""
+    """父图状态：对话 + 检索 + 路由 + 结果桥接。"""
     messages: Annotated[list, add_messages]
 
-    # 需求判断结果（不规划任何执行细节）
-    route: Optional[str]          # "animal" | "plant" | "chat"
+    route: Optional[str]
     route_reason: Optional[str]
-    kb: Optional[str]             # route=chat 时选定的知识库 key；"none" 表示无需检索
+    kb: Optional[str]
 
-    # 知识库检索结果（来自选定的知识库）
+    # 知识库检索结果
     retrieved_docs: Optional[List[str]]
 
-    # 桥接通道：分发任务 / 收取结果（对应两个子图，互不干扰）
+    # 桥接通道：分发任务 / 收取结果
     animal_request: Optional[str]
     animal_result: Optional[Dict[str, Any]]
     plant_request: Optional[str]
@@ -85,7 +58,7 @@ llm = ChatDeepSeek(
 )
 
 
-# ========== skills 发现（技能 JSON 位于 subgraph_agent.py 约定的目录） ==========
+# ========== skills 发现==========
 animal_skill_registry = discover_skills(ANIMAL_SKILLS_ROOT)
 plant_skill_registry = discover_skills(PLANT_SKILLS_ROOT)
 
@@ -93,7 +66,7 @@ print(f"[SKILLS] 动物技能 {len(animal_skill_registry)} 个：{[s['id'] for s
 print(f"[SKILLS] 植物技能 {len(plant_skill_registry)} 个：{[s['id'] for s in plant_skill_registry]}")
 
 
-# ========== 编译两个子图（实现见 subgraph_agent.py） ==========
+# ========== 编译两个子图==========
 checkpointer = MemorySaver()
 
 animal_base_work_agent = build_base_work_agent(
@@ -122,7 +95,7 @@ print("[GRAPH] animal_base_work_agent / plant_base_work_agent 已编译")
 
 
 # ============================================================
-# 父图：需求判断（不规划）→ 分发子图 或 检索知识库 → 结果汇报
+# 父图：需求判断→ 分发子图 或 检索知识库 → 结果汇报
 # ============================================================
 
 SOP_DOCX_PATH = os.getenv("SOP_DOCX_PATH", r"D:\PythonProject1\生态环境调查报告工作sop.docx")
@@ -133,9 +106,6 @@ EMBED_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
 
 # ========== 多知识库（多向量数据库）注册表 ==========
-# 父图先判断用户需求：
-#   - 数据分析/报告任务 → 分发给对应子图（animal / plant）；
-#   - 知识问答/科普 → 从下列知识库中选择最匹配的一个进行混合检索并简述回答。
 # 每个知识库独立使用一个 chromadb 持久化目录 + collection，并缓存 chunks 供 BM25 使用。
 KNOWLEDGE_BASES: Dict[str, Dict[str, Any]] = {
     "sop": {
@@ -145,7 +115,7 @@ KNOWLEDGE_BASES: Dict[str, Dict[str, Any]] = {
         "collection": "sop_semantic",
         "chunks_file": "sop_chunks.json",
     },
-    # 预留：按需新增其它向量数据库，路由会自动识别（无需改图结构）
+    # 预留：按需新增其它向量数据库，路由会自动识别
     # "species": {
     #     "label": "物种知识库",
     #     "description": "陆生动物/植物物种名录、保护级别、居留型、生活习性等",
@@ -158,7 +128,7 @@ DEFAULT_KB = "sop"
 
 
 def _kb_catalog_text() -> str:
-    """知识库目录文本（供需求判断节点选择）。"""
+    """知识库目录文本。"""
     lines = []
     for key, cfg in KNOWLEDGE_BASES.items():
         lines.append(f'- "{key}"：{cfg.get("label", key)}（{cfg.get("description", "")}）')
@@ -331,8 +301,14 @@ _reranker_lock = threading.Lock()
 _RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") == "1"
 
 
+client = InferenceClient(
+    provider="hf-inference",
+    api_key=os.getenv("HF_TOKEN"),
+)
+
+
 def _get_reranker():
-    """惰性加载 BGE-Reranker-v2-m3，显存较低友好配置。"""
+    """惰性加载 BGE-Reranker-v2-m3。"""
     global _reranker
     if _reranker is not None:
         return _reranker
@@ -343,9 +319,9 @@ def _get_reranker():
             device = "cuda" if torch.cuda.is_available() else "cpu"
             _reranker = FlagReranker(
                 "BAAI/bge-reranker-v2-m3",
-                use_fp16=(device == "cuda"),   # CPU 上 FP16 反而更慢
+                cache_dir=r"D:/hf_cache/hub",
+                use_fp16=(device == "cuda"),
                 devices=device,
-                # 关键：限制单次最大 batch，避免显存 OOM
                 query_max_length=512,
                 passage_max_length=512,
             )
@@ -374,14 +350,7 @@ def _cached_rerank(query: str, doc_tuple: tuple):
 
 def retrieve_kb_chunks(kb: str, query: str, k: int = 5,
                        rerank_top_k: int = 15) -> List[str]:
-    """在指定知识库中混合检索：语义（DashScope）+ 关键词（BM25）→ RRF 融合 → BGE 精排。
-
-    Args:
-        kb:              知识库 key
-        query:           用户查询
-        k:               最终返回的文档数（送入 LLM 的上下文）
-        rerank_top_k:    送入重排序的候选数（需 > k），6GB 显存建议 15-25
-    """
+    """在指定知识库中混合检索：语义（DashScope）+ 关键词（BM25）→ RRF 融合 → BGE 精排。"""
     chunks = _load_chunks(kb)
     if not chunks:
         return []
@@ -451,7 +420,7 @@ def parent_list_files(directory: str = ".") -> List[str]:
 
 @tool
 def parent_read_file_content(file_path: str) -> str:
-    """读取文本文件（.txt/.py/.json/.csv 等）内容。不支持二进制文件。"""
+    """读取文本文件（.txt/.py/.json/.csv 等）内容。"""
     try:
         if not os.path.exists(file_path):
             return f"错误：文件 {file_path} 不存在"
@@ -516,7 +485,7 @@ def _get_last_human_text(state) -> str:
 # ---------- 父图节点 ----------
 
 def parent_router_node(state: ParentState) -> Dict:
-    """需求判断节点：先判断用户需求，再决定【分发子图】或【检索知识库】。"""
+    """需求判断节点：先判断用户需求，再决定分发子图或检索知识库。"""
     user_text = _get_last_human_text(state)
     system_prompt = PARENT_ROUTER_SYSTEM_PROMPT.replace("{kb_catalog}", _kb_catalog_text())
 

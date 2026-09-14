@@ -1,15 +1,10 @@
 """子图模块：陆生动物 / 陆生植物基础工作子图（base work agent）。
 
-本文件由 agent3.5.py 拆分而来，便于独立维护与更新。
-
 每个子图的执行流程：
     父图委派(request 桥接) → 任务规划器(输出 JSON)
       → executor / single_executor
       →（审核 / 执行失败 / 必填参数缺失 时通过 interrupt 询问用户）
       → finish 节点把结果写回 RESULT 桥接通道
-
-父子图之间只通过 request_key / result_key 两个桥接通道交换最少信息，
-子图内部执行字段与父图状态完全隔离。
 """
 
 import os, json, subprocess, sys, re
@@ -27,44 +22,12 @@ from langchain_core.messages import SystemMessage, HumanMessage
 class AnimalAnalysisState(TypedDict):
     """动物子图 animal_base_work_agent 的状态（与父图状态分离）。"""
     # --- 桥接通道：仅这两个键与父图同名共享（随任务置位、结束后清空） ---
-    animal_request: Optional[str]                 # 父图转发的原始用户任务文本
-    animal_result: Optional[Dict[str, Any]]       # 子图返回父图的最终结果
-    # --- 共享对话通道（父图/子图可见；子图执行路径不写 messages） ---
+    animal_request: Optional[str]
+    animal_result: Optional[Dict[str, Any]]
+    # --- 共享对话通道（父图/子图可见） ---
     messages: Annotated[list, add_messages]
     # --- 内部执行字段（父图不可见，不写入父图） ---
-    domain: Optional[str]                         # "animal"
-    execution_mode: str                           # "chat"|"workflow"|"single_skill"|"need_info"|"idle"
-    skill_registry: Optional[List[Dict]]
-    selected_skill: Optional[str]
-    skill_config: Optional[Dict]
-    skill_params: Optional[Dict]
-    work_dir: str
-    input_file: str
-    history_file: str
-    pa: str
-    regional_level: str
-    current_step_idx: int
-    workflow_steps: List[Dict]
-    step_outputs: Dict[str, Any]
-    review_feedback: Optional[str]
-    approved: Optional[bool]
-    review_action: Optional[str]
-    retry_count: Dict[str, int]
-    retry_target_idx: Optional[int]
-    final_output: Optional[Any]
-    error: Optional[str]
-    sub_delegated: Optional[bool]                 # 本轮是否为父图委派
-
-
-class PlantAnalysisState(TypedDict):
-    """植物子图 plant_base_work_agent 的状态（与父图状态分离）。"""
-    # --- 桥接通道：仅这两个键与父图同名共享 ---
-    plant_request: Optional[str]
-    plant_result: Optional[Dict[str, Any]]
-    # --- 共享对话通道 ---
-    messages: Annotated[list, add_messages]
-    # --- 内部执行字段（与动物子图命名一致，父图不可见） ---
-    domain: Optional[str]                         # "plant"
+    domain: Optional[str]
     execution_mode: str
     skill_registry: Optional[List[Dict]]
     selected_skill: Optional[str]
@@ -86,6 +49,40 @@ class PlantAnalysisState(TypedDict):
     final_output: Optional[Any]
     error: Optional[str]
     sub_delegated: Optional[bool]
+
+
+class PlantAnalysisState(TypedDict):
+    """植物子图 plant_base_work_agent 的状态（与父图状态分离）。"""
+    # --- 桥接通道：仅这两个键与父图同名共享 ---
+    plant_request: Optional[str]
+    plant_result: Optional[Dict[str, Any]]
+    # --- 共享对话通道 ---
+    messages: Annotated[list, add_messages]
+    # --- 内部执行字段（与动物子图命名一致，父图不可见） ---
+    domain: Optional[str]
+    execution_mode: str
+    skill_registry: Optional[List[Dict]]
+    selected_skill: Optional[str]
+    skill_config: Optional[Dict]
+    skill_params: Optional[Dict]
+    work_dir: str
+    input_file: str
+    history_file: str
+    pa: str
+    regional_level: str
+    current_step_idx: int
+    workflow_steps: List[Dict]
+    step_outputs: Dict[str, Any]
+    review_feedback: Optional[str]
+    approved: Optional[bool]
+    review_action: Optional[str]
+    retry_count: Dict[str, int]
+    retry_target_idx: Optional[int]
+    final_output: Optional[Any]
+    error: Optional[str]
+    sub_delegated: Optional[bool]
+
+
 # ========== skills 发现与加载 ==========
 def discover_skills(skills_root: Path) -> List[Dict[str, Any]]:
     """扫描 skills_root/*.json，提取 name, description 和 json 路径"""
@@ -131,8 +128,6 @@ def _load_full_skill_from(registry: List[Dict], skill_name: str) -> tuple:
 
 
 # 动物技能放在 skills/ 根目录；植物技能放在 plant_skills/ 目录（各自独立发现）
-# 说明：植物技能暂未创建/验证，plant_base_work_agent 的规划器与执行器已就绪，
-# 后续只需在 plant_skills/ 下放入植物技能 JSON（及对应脚本）即可自动启用。
 ANIMAL_SKILLS_ROOT = Path("./skills")
 PLANT_SKILLS_ROOT = Path("./plant_skills")
 # ========== 共享工具（脚本执行 / 文件读取） ==========
@@ -360,8 +355,6 @@ def _normalize_workflow_steps(steps: List[Dict]) -> List[Dict]:
 
 
 # ============================================================
-# 必填参数检查（脚本参数缺失时先询问用户）
-# ------------------------------------------------------------
 # 技能的 parameters 字段形如 {参数名: 参数说明}，说明中含"必填"的即为必填项。
 # 执行脚本前若必填项无值，则通过 interrupt 询问用户：
 #   - 提供参数：用户逐项输入，未输入的项按"使用脚本默认参数"处理；
@@ -462,10 +455,6 @@ def prompt_missing_required_params(domain: str, domain_label: str, skill_name: s
 
 # ============================================================
 # 子图构造器（动物 / 植物共用一套内部结构，命名空间一致）
-# ------------------------------------------------------------
-# 每个子图：
-#   父图委派(REQUEST 桥接) → 任务规划器(输出 JSON) → executor / single_executor
-#     →（审核 / 失败中断）→ finish 节点把结果写回 RESULT 桥接通道
 # ============================================================
 
 SUB_PLANNER_SYSTEM_PROMPT = """你是{domain_label}数据分析子图的"任务规划器"。
@@ -513,10 +502,10 @@ def _build_skill_catalog_text(registry: List[Dict]) -> str:
 
 def build_base_work_agent(
     *,
-    request_key: str,          # "animal_request" | "plant_request"
-    result_key: str,           # "animal_result" | "plant_result"
-    domain: str,               # "animal" | "plant"
-    domain_label: str,         # "陆生动物" | "陆生植物"
+    request_key: str,
+    result_key: str,
+    domain: str,
+    domain_label: str,
     state_cls,
     registry: List[Dict],
     planner_llm,
