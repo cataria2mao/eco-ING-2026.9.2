@@ -6,9 +6,9 @@
 
 核心设计思想（agent3.5）：
 
-- **父图（协调层）**：【需求判断】（动物任务 / 植物任务 / 知识问答）→ 数据分析/报告任务：将任务转发给对应子图 → 接收子图结果汇报。or
+- **父图（协调+RAG）**：【需求判断】（动物任务 / 植物任务 / 知识问答）→ 数据分析/报告任务：将任务转发给对应子图 → 接收子图结果汇报。or
 → 知识问答（RAG）：从多个向量知识库中选择最匹配的一个做混合检索（DashScope 语义 + BM25）→ RRF融合 → Cross-Encoder精排→ 基于检索资料简述回答。
-- **子图**：建立两个 base work agent（`animal_base_work_agent` 动物子图、`plant_base_work_agent` 植物子图）。子图收到任务后，先由各自的【任务规划器】根据「用户输入 + 本子图技能目录」输出 JSON，决定执行方式（`workflow` / `single_skill` / `chat`）。
+- **子图**：建立两个 base work agent（`animal_base_work_agent` 动物子图、`plant_base_work_agent` 植物子图）。子图收到任务后，先由各自的【任务规划器】根据「用户输入 + 本子图技能目录」输出 JSON，决定执行方式（`workflow` / `single_skill` / `chat`），支持工作流编排，人机协同（Human-in-the-loop），工具调用，。
 - **状态分离**：子图内部执行字段（`execution_mode` / `workflow_steps` / `step_outputs` …）与父图完全隔离；父图与子图之间仅通过「桥接通道」交换最小信息：`animal_request / animal_result`（动物）、`plant_request / plant_result`（植物），互不覆盖。
 
 ---
@@ -16,7 +16,7 @@
 ## ✨ 功能特性
 
 - **三图协作架构（父图 + 两个领域子图）**
-  - 父图（协调层）：【需求判断】（动物任务 / 植物任务 / 知识问答）
+  - 父图（协调+RAG）：【需求判断】（动物任务 / 植物任务 / 知识问答）
   - - → 数据分析/报告任务：将任务转发给对应子图 → 接收子图结果汇报；
   - - → 知识问答（RAG）：从多个向量知识库中选择最匹配的一个做混合检索（DashScope 语义 + BM25）→ RRF融合 → Cross-Encoder精排 → 基于检索资料简述回答。
   - 动物子图 `animal_base_work_agent`：任务规划器 → 工作流/单技能执行器 → 审核中断 → 结果写回
@@ -33,67 +33,31 @@
 - **参数自动抽取**：子图规划器从自然语言中抽取工作路径、输入文件、保护级别、居留型等参数；用户未提供的键省略（脚本使用默认值，不编造文件路径）
 
 ---
-## ✨ 父图
-<img width="805" height="514" alt="55e4b6f300760f47e3f3d5efeb55044b" src="https://github.com/user-attachments/assets/111a8307-8f48-4d98-afaf-241b8b6ecaac" />
-
----
-## ✨ 子图
-<img width="752" height="620" alt="89fef303cfad5f8fa3b495573c11f923" src="https://github.com/user-attachments/assets/9be2c67c-31d4-46b9-9464-ff7cd5f9b4e8" />
-
----
 
 ## 🏗 架构设计
 
-```
-                          ┌────────────────────────────────────────────────┐
-                          │                 父图 parent_graph               │
-  用户输入 ───────────────▶│                                                │
-                          │  parent_retrieve   混合检索 SOP 知识库            │
-                          │        │                                       │
-                          │        ▼                                       │
-                          │  parent_router     任务路由（只分类，不规划）      │
-                          │    ├─ animal ──┐                                │
-                          │    ├─ plant  ──┤                                │
-                          │    └─ chat ────┼──▶ parent_chat（问答/查看文件）   │
-                          │        │       │        ▲                       │
-                          │        ▼       │        │                       │
-                          │  parent_dispatch│        │ 汇报（SystemMessage）   │
-                          │   （原样转发用户需求到桥接通道） │                  │
-                          └───────┬────────┴────────┼───────────────────────┘
-                                  │                 │
-                 animal_request   │                 │  plant_request
-                                  ▼                 ▼
-       ┌─────────────────────────────────┐  ┌─────────────────────────────────┐
-       │   animal_base_work_agent（动物）  │  │   plant_base_work_agent（植物）   │
-       │                                 │  │                                 │
-       │  planner     任务规划器（输出JSON）│  │  planner     任务规划器（输出JSON） │
-       │    ├─ workflow      ──▶ executor │  │    ├─ workflow      ──▶ executor │
-       │    ├─ single_skill  ──▶ single_executor │    ├─ single_skill ──▶ ... │
-       │    └─ need_info/chat ─▶ finish   │  │    └─ need_info/chat ─▶ finish   │
-       │                                 │  │                                 │
-       │  executor     多步骤工作流执行     │  │  executor     多步骤工作流执行     │
-       │    ├─ skill 步骤（Python/R 脚本）  │  │    ├─ skill 步骤（Python/R 脚本）  │
-       │    ├─ review 步骤（interrupt 审核）│  │    ├─ review 步骤（interrupt 审核）│
-       │    └─ 执行失败中断（retry/abort）  │  │    └─ 执行失败中断（retry/abort）  │
-       │                                 │  │                                 │
-       │  finish      结果写回 animal_result│  │  finish      结果写回 plant_result │
-       └────────────────┬────────────────┘  └────────────────┬────────────────┘
-                        │                                      │
-                        ▼                                      ▼
-              父图 parent_report（汇总子图结果）→ parent_chat 汇报给用户
+
+## ✨ 父图
+<img width="805" height="514" alt="55e4b6f300760f47e3f3d5efeb55044b" src="https://github.com/user-attachments/assets/111a8307-8f48-4d98-afaf-241b8b6ecaac" />
+
+
+## ✨ 子图
+<img width="752" height="620" alt="89fef303cfad5f8fa3b495573c11f923" src="https://github.com/user-attachments/assets/9be2c67c-31d4-46b9-9464-ff7cd5f9b4e8" />
+
+
 ```
 
 ### 各图职责
 
 | 图 | 节点 | 职责 |
 |----|------|------|
-| 父图 | `parent_retrieve` | 从 SOP 向量库混合检索相关资料 |
-| 父图 | `parent_router` | 路由判断：`animal` / `plant` / `chat`（**不规划执行细节**） |
-| 父图 | `parent_dispatch` | 将【原始用户输入原样】写入对应桥接通道 `animal_request` / `plant_request` |
+| 父图 | `parent_router` | 由LLM判断用户需求：将工作任务分发至对应子图/选择检索相关领域向量数据库/直接问答|
+| 父图 | `parent_retrieve` |检索相关领域向量数据库：混合检索（语义 + BM25）→ RRF融合 → Cross-Encoder重排序器 ，向量库使用 Chroma|
+| 父图 | `parent_dispatch` | 将原始用户输入写入对应桥接通道 `animal_request` / `plant_request` |
 | 父图 | `parent_report` | 汇总 `animal_result` / `plant_result`，格式化后交给对话层汇报 |
-| 父图 | `parent_chat` | 回答一般问题、查看文件（`parent_list_files` / `parent_read_file_content`）、汇报子图执行结果 |
-| 子图（动物/植物） | `planner` | 任务规划器：根据用户输入 + 本子图技能目录输出 JSON（`workflow` / `single_skill` / `chat`） |
-| 子图（动物/植物） | `executor` | 多步骤工作流执行，支持步骤间文件依赖、review 审核中断、失败重试 |
+| 父图 | `parent_chat` | 回答一般问题、专业问题（RAG）、汇报子图执行结果、查看文件（`parent_list_files` / `parent_read_file_content`）|
+| 子图（动物/植物） | `planner` | 任务规划器：由LLM根据用户输入 + 本子图技能目录输出 JSON（`workflow` / `single_skill` / `chat`） |
+| 子图（动物/植物） | `executor` | 多步骤工作流执行，支持步骤间文件依赖、人机协同（Human-in-the-loop）、失败重试 |
 | 子图（动物/植物） | `single_executor` | 单技能直接执行 |
 | 子图（动物/植物） | `finish` | 收尾：把结果写回 `animal_result` / `plant_result`，并清空请求通道 |
 
