@@ -25,7 +25,7 @@
   - 语义检索：DashScope `text-embedding-v3`
   - 关键词检索：纯 Python 实现的 Okapi BM25（中文整词 + 字符 bigram）
   - 融合算法：RRF（Reciprocal Rank Fusion），向量库使用 Chroma
-  - 	Cross-Encoder精排：基于bge-reranker-v2-m3模型完成重排序。
+  - Cross-Encoder精排：基于bge-reranker-v2-m3模型完成重排序。
 - **技能热插拔**：技能以 JSON 声明式配置，新增技能无需改代码
   - 动物技能放在 `skills/` 根目录；植物技能放在 `plant_skills/` 目录（各自独立发现）
 - **工作流编排 + 人工审核中断**：支持多步骤工作流、步骤间文件依赖、`interrupt()` 人工审核点、重试/终止；脚本执行失败也会触发中断等待人工决定
