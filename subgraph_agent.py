@@ -1,7 +1,7 @@
 """子图模块：陆生动物 / 陆生植物基础工作子图（base work agent）。
 
 每个子图的执行流程：
-    父图委派(request 桥接) → 任务规划器(输出 JSON)
+    父图委派(request 桥接) → 任务规划器(可先调用工具勘察，再输出 JSON)
       → executor / single_executor
       →（审核 / 执行失败 / 必填参数缺失 时通过 interrupt 询问用户）
       → finish 节点把结果写回 RESULT 桥接通道
@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import TypedDict, Optional, Any, List, Dict, Annotated
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
+from langgraph.graph.message import add_messages, RemoveMessage
+from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 class AnimalAnalysisState(TypedDict):
     """动物子图 animal_base_work_agent 的状态（与父图状态分离）。"""
@@ -26,6 +27,10 @@ class AnimalAnalysisState(TypedDict):
     animal_result: Optional[Dict[str, Any]]
     # --- 共享对话通道（父图/子图可见） ---
     messages: Annotated[list, add_messages]
+    # --- 规划器工具循环通道（父图不可见） ---
+    planner_messages: Annotated[list, add_messages]
+    planner_active: Optional[bool]
+    planner_tool_rounds: int
     # --- 内部执行字段（父图不可见，不写入父图） ---
     domain: Optional[str]
     execution_mode: str
@@ -58,6 +63,10 @@ class PlantAnalysisState(TypedDict):
     plant_result: Optional[Dict[str, Any]]
     # --- 共享对话通道 ---
     messages: Annotated[list, add_messages]
+    # --- 规划器工具循环通道（父图不可见） ---
+    planner_messages: Annotated[list, add_messages]
+    planner_active: Optional[bool]
+    planner_tool_rounds: int
     # --- 内部执行字段（与动物子图命名一致，父图不可见） ---
     domain: Optional[str]
     execution_mode: str
@@ -222,6 +231,13 @@ def run_r(script_path: str, script_args: str) -> str:
     except Exception as e:
         return f"执行异常：{e}"
 
+
+# 规划器工具循环最大轮次（超过后强制模型直接输出最终 JSON，防止无限调用工具）
+MAX_PLANNER_TOOL_ROUNDS = 3
+
+tools = [run_r, run_python, read_docx, read_xlsx, list_files]
+# 工具执行结果写入内部通道 planner_messages，供规划器下一轮读取，父图不可见
+tool_node = ToolNode(tools, messages_key="planner_messages")
 
 # ========== 纯辅助函数（领域无关） ==========
 
@@ -474,6 +490,11 @@ SUB_PLANNER_SYSTEM_PROMPT = """你是{domain_label}数据分析子图的"任务�
   输出 {{"action": "chat", "reason": "需要向用户澄清/说明的内容"}}；
   仅缺少参数不构成 chat 的理由。
 
+【工具使用】
+- 规划前你可以先调用工具了解环境：用 list_files 查看目录、read_xlsx / read_docx 读取数据文件，
+  必要时用 run_python / run_r 探查脚本输出，以便确认可用技能与参数（如 work_dir / input_file）。
+- 工具只用于辅助规划，最多调用几轮；信息足够后必须输出上面的最终 JSON，不要用工具代替最终规划。
+
 输出 JSON 三选一：
 {{"action": "workflow", "mode": "workflow", "task_name": "...", "skill_id": "...", "parameters": {{...}}, "workflow_steps": [...]}}
 或
@@ -517,6 +538,9 @@ def build_base_work_agent(
     仅通过 request_key / result_key 两个桥接通道与父图交换信息。
     """
 
+
+    planner_llm_with_tools = planner_llm.bind_tools(tools)
+
     def _load(skill_name: str) -> tuple:
         return _load_full_skill_from(registry, skill_name)
 
@@ -529,44 +553,85 @@ def build_base_work_agent(
         user_text = (state.get(request_key) or "").strip()
         catalog_text = _build_skill_catalog_text(registry) or "（本子图暂无技能）"
 
-        # 重置内部执行状态（同一 checkpoint 命名空间下可能残留上一轮数据）
-        update = {
-            "domain": domain,
-            "sub_delegated": True,
-            "execution_mode": "idle",
-            "selected_skill": None,
-            "skill_config": None,
-            "skill_params": {},
-            "work_dir": "", "input_file": "", "history_file": "", "pa": "", "regional_level": "",
-            "workflow_steps": [],
-            "current_step_idx": 0,
-            "step_outputs": {},
-            "retry_count": {},
-            "review_action": None,
-            "review_feedback": None,
-            "approved": None,
-            "error": None,
-            "final_output": None,
-        }
-
         user_prompt = f"""技能目录（每行一个技能 JSON）：
 {catalog_text}
 
-用户输入（父图原样转发）：
+用户输入：
 {user_text}
 
 请输出 JSON："""
 
-        try:
-            resp = planner_llm.invoke([
+        # 规划器工具循环历史（内部通道 planner_messages）
+        planner_msgs = list(state.get("planner_messages") or [])
+        is_tool_continuation = bool(state.get("planner_active"))
+
+        # 需要从通道中移除的旧消息（仅新一轮规划时产生）
+        stale_removals: List[Any] = []
+
+        if is_tool_continuation:
+            # 上一轮工具已执行完毕，带着工具结果继续规划
+            messages_for_llm = planner_msgs
+            rounds = state.get("planner_tool_rounds", 0)
+            update: Dict[str, Any] = {"domain": domain, "sub_delegated": True}
+        else:
+            # 新一轮规划：重置内部执行状态（同一 checkpoint 命名空间下可能残留上一轮数据），
+            # 并准备清空上一轮遗留的工具循环消息
+            update = {
+                "domain": domain,
+                "sub_delegated": True,
+                "execution_mode": "idle",
+                "selected_skill": None,
+                "skill_config": None,
+                "skill_params": {},
+                "work_dir": "", "input_file": "", "history_file": "", "pa": "", "regional_level": "",
+                "workflow_steps": [],
+                "current_step_idx": 0,
+                "step_outputs": {},
+                "retry_count": {},
+                "review_action": None,
+                "review_feedback": None,
+                "approved": None,
+                "error": None,
+                "final_output": None,
+                "planner_active": True,
+                "planner_tool_rounds": 0,
+            }
+            stale_removals = [RemoveMessage(id=m.id) for m in planner_msgs if getattr(m, "id", None)]
+            messages_for_llm = [
                 SystemMessage(content=planner_system_prompt),
                 HumanMessage(content=user_prompt),
-            ])
-            content = resp.content if hasattr(resp, 'content') else str(resp)
-            plan = _parse_json_safely(content)
+            ]
+            rounds = 0
+
+        # 达到工具调用上限后不再绑定工具，强制模型直接输出最终 JSON
+        planner_model = planner_llm_with_tools if rounds < MAX_PLANNER_TOOL_ROUNDS else planner_llm
+        try:
+            resp = planner_model.invoke(messages_for_llm)
         except Exception as e:
             print(f"[DEBUG] planner({domain}) LLM 异常: {e}")
-            plan = {}
+            resp = None
+
+        # 规划器请求调用工具：写入内部通道，交给 tools 节点执行后再回到规划器
+        if resp is not None and getattr(resp, "tool_calls", None):
+            tool_summary = ", ".join(
+                f"{tc.get('name')}({json.dumps(tc.get('args', {}), ensure_ascii=False)[:120]})"
+                for tc in resp.tool_calls)
+            print(f"[DEBUG] planner({domain}) 调用工具 → {tool_summary}")
+            if is_tool_continuation:
+                update["planner_messages"] = [resp]
+            else:
+                update["planner_messages"] = stale_removals + messages_for_llm + [resp]
+            update["planner_active"] = True
+            update["planner_tool_rounds"] = rounds + 1
+            return update
+
+        content = resp.content if resp is not None and hasattr(resp, 'content') else str(resp or "")
+        plan = _parse_json_safely(content)
+
+        # 规划完成，关闭工具循环；同时清理上一轮遗留的工具循环消息
+        if stale_removals:
+            update["planner_messages"] = stale_removals
+        update["planner_active"] = False
 
         action = plan.get("action")
         print(f"[DEBUG] planner({domain}) action={action}, plan={json.dumps(plan, ensure_ascii=False)[:300]}")
@@ -1073,7 +1138,15 @@ def build_base_work_agent(
             }
         }
 
-    def retry_node_fn(state, target_idx: int):
+    def retry_node(state):
+        """单节点重试：清除目标技能步骤及其后续输出，回到该步骤重新执行。"""
+        target_idx = find_previous_skill_idx(state)
+        if target_idx is None:
+            return {
+                "review_action": "abort",
+                "review_feedback": state.get("review_feedback") or "重试失败：未找到可重试的技能步骤",
+                "approved": None,
+            }
         steps = state["workflow_steps"]
         cleaned_outputs = dict(state["step_outputs"])
         for i in range(target_idx, len(steps)):
@@ -1081,6 +1154,7 @@ def build_base_work_agent(
             cleaned_outputs.pop(step_key, None)
         return {
             "current_step_idx": target_idx,
+            "retry_target_idx": target_idx,
             "step_outputs": cleaned_outputs,
             "review_action": None,
             "review_feedback": None,
@@ -1143,17 +1217,23 @@ def build_base_work_agent(
     # ---------------- 路由 ----------------
 
     def entry_router(state):
-        """入口路由：父图委派（request 非空）→ 规划器；否则按已有执行状态走。"""
+        """入口路由：父图委派（request 非空）→ 规划器；否则直接结束。
+
+        说明：子图只在父图 parent_dispatch 写入非空 request 后被调用；
+        人工审核/失败重试通过 interrupt 在 executor 节点内部恢复，
+        不会回到 START，因此这里无需再按旧的执行状态续跑。
+        """
         if state.get(request_key):
             return "planner"
-        mode = state.get("execution_mode")
-        if mode == "workflow" and state.get("workflow_steps"):
-            return "executor"
-        if mode == "single_skill" and state.get("skill_config"):
-            return "single_executor"
         return "idle"
 
     def planner_router(state):
+        # 规划器请求调用工具：先路由到 tools 节点执行，执行完再回到 planner
+        planner_msgs = state.get("planner_messages") or []
+        last = planner_msgs[-1] if planner_msgs else None
+        if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+            return "tools"
+
         mode = state.get("execution_mode")
         if mode == "workflow":
             return "executor"
@@ -1177,9 +1257,8 @@ def build_base_work_agent(
         if action == "abort":
             return "workflow_abort"
         if action in ("retry", "retry_previous"):
-            prev_idx = find_previous_skill_idx(state)
-            if prev_idx is not None:
-                return f"retry_step_{prev_idx}"
+            if find_previous_skill_idx(state) is not None:
+                return "retry_step"
             return "workflow_abort"
         if action == "continue":
             return "continue_step"
@@ -1189,20 +1268,17 @@ def build_base_work_agent(
     builder = StateGraph(state_cls)
 
     builder.add_node("planner", sub_planner_node)
+    builder.add_node("tools", tool_node)
     builder.add_node("executor", step_executor_node)
     builder.add_node("single_executor", single_executor_node)
     builder.add_node("continue", continue_node)
     builder.add_node("abort", abort_node)
     builder.add_node("complete", complete_node)
     builder.add_node("finish", sub_finish_node)
-
-    for i in range(3):
-        builder.add_node(f"retry_{i}", lambda s, idx=i: retry_node_fn(s, idx))
+    builder.add_node("retry", retry_node)
 
     builder.add_conditional_edges(START, entry_router, {
         "planner": "planner",
-        "executor": "executor",
-        "single_executor": "single_executor",
         "idle": END,
     })
 
@@ -1210,19 +1286,21 @@ def build_base_work_agent(
         "executor": "executor",
         "single_executor": "single_executor",
         "finish": "finish",
+        "tools": "tools",
     })
+
+    builder.add_edge("tools", "planner")
 
     builder.add_conditional_edges("executor", workflow_router, {
         "workflow_complete": "complete",
         "workflow_abort": "abort",
         "execute_step": "executor",
         "continue_step": "continue",
-        **{f"retry_step_{i}": f"retry_{i}" for i in range(3)}
+        "retry_step": "retry",
     })
 
     builder.add_edge("continue", "executor")
-    for i in range(3):
-        builder.add_edge(f"retry_{i}", "executor")
+    builder.add_edge("retry", "executor")
 
     builder.add_edge("complete", "finish")
     builder.add_edge("abort", "finish")
@@ -1230,3 +1308,5 @@ def build_base_work_agent(
     builder.add_edge("finish", END)
 
     return builder.compile(checkpointer=checkpointer)
+
+
