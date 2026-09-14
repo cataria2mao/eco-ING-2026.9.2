@@ -33,6 +33,14 @@
 - **参数自动抽取**：子图规划器从自然语言中抽取工作路径、输入文件、保护级别、居留型等参数；用户未提供的键省略（脚本使用默认值，不编造文件路径）
 
 ---
+## ✨ 父图
+<img width="805" height="514" alt="55e4b6f300760f47e3f3d5efeb55044b" src="https://github.com/user-attachments/assets/111a8307-8f48-4d98-afaf-241b8b6ecaac" />
+
+---
+## ✨ 子图
+<img width="752" height="620" alt="89fef303cfad5f8fa3b495573c11f923" src="https://github.com/user-attachments/assets/9be2c67c-31d4-46b9-9464-ff7cd5f9b4e8" />
+
+---
 
 ## 🏗 架构设计
 
