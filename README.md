@@ -8,7 +8,7 @@
 
 - **父图（协调+RAG）**：【需求判断】（动物任务 / 植物任务 / 知识问答）→ 数据分析/报告任务：将任务转发给对应子图 → 接收子图结果汇报。or
 → 知识问答（RAG）：从多个向量知识库中选择最匹配的一个做混合检索（DashScope 语义 + BM25）→ RRF融合 → Cross-Encoder精排→ 基于检索资料简述回答。
-- **子图**：建立两个 base work agent（`animal_base_work_agent` 动物子图、`plant_base_work_agent` 植物子图）。子图收到任务后，先由各自的【任务规划器】根据「用户输入 + 本子图技能目录」输出 JSON，决定执行方式（`workflow` / `single_skill` / `chat`），支持工作流编排，人机协同（Human-in-the-loop），工具调用，。
+- **子图**：建立两个 base work agent（`animal_base_work_agent` 动物子图、`plant_base_work_agent` 植物子图）。子图收到任务后，先由各自的【任务规划器】根据「用户输入 + 本子图技能目录」输出 JSON，决定执行方式（`workflow` / `single_skill` / `chat`），支持工作流编排，人机协同（Human-in-the-loop），工具调用。
 - **状态分离**：子图内部执行字段（`execution_mode` / `workflow_steps` / `step_outputs` …）与父图完全隔离；父图与子图之间仅通过「桥接通道」交换最小信息：`animal_request / animal_result`（动物）、`plant_request / plant_result`（植物），互不覆盖。
 
 ---
