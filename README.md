@@ -38,11 +38,11 @@
 
 
 ## ✨ 父图
-<img width="805" height="514" alt="55e4b6f300760f47e3f3d5efeb55044b" src="https://github.com/user-attachments/assets/111a8307-8f48-4d98-afaf-241b8b6ecaac" />
-
+<img width="695" height="717" alt="collaboration" src="https://github.com/user-attachments/assets/7756e74a-a042-4163-aef7-bb00f9200fba" />
 
 ## ✨ 子图
-<img width="752" height="620" alt="89fef303cfad5f8fa3b495573c11f923" src="https://github.com/user-attachments/assets/9be2c67c-31d4-46b9-9464-ff7cd5f9b4e8" />
+<img width="968" height="579" alt="collaboration3" src="https://github.com/user-attachments/assets/bfd37635-69b9-4d55-9d8d-618b5b32e309" />
+
 
 
 ```
