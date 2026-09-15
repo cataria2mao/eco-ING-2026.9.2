@@ -13,6 +13,7 @@ build/
 
 # ===== 向量库 / 运行时产物 =====
 chroma_sop_db/
+chroma_species_db/
 
 # ===== 日志 / 临时文件 =====
 *.log
