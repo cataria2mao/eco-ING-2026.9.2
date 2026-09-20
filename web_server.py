@@ -1,4 +1,3 @@
-# web_server.py
 import json
 from pathlib import Path
 
@@ -62,7 +61,7 @@ async def ws_chat(ws: WebSocket, thread_id: str):
     config = {"configurable": {"thread_id": thread_id}}
     sent_ids: set = set()
 
-    # 断线重连时把历史消息回放一遍（可选）
+    # 断线重连时把历史消息回放一遍
     try:
         state = parent_graph.get_state(config)
         for msg in state.values.get("messages", []) or []:
