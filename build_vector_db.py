@@ -8,12 +8,12 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-SOP_DOCX_PATH = os.getenv("SOP_DOCX_PATH", r"D:\PythonProject1\生态环境调查报告工作.docx")
-CHROMA_DIR = os.getenv("CHROMA_DIR", str(Path(__file__).resolve().parent / "chroma_sop_db"))
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v3")
+SOP_DOCX_PATH = os.getenv("SOP_DOCX_PATH", r"D:\PythonProject1\物种百科.docx")    #需要向量化的docx文件路径
+CHROMA_DIR = os.getenv("CHROMA_DIR", str(Path(__file__).resolve().parent / "chroma_species_db"))   #向量库路径
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v4")
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 EMBED_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-COLLECTION_NAME = "sop_semantic"
+COLLECTION_NAME = "species_semantic"   #
 
 
 class DashScopeEmbeddingFunction:
@@ -126,7 +126,7 @@ def main():
     )
 
     # 可选但推荐：保存 chunks，供原文件构建 BM25 用
-    cache_file = Path(CHROMA_DIR) / "sop_chunks.json"
+    cache_file = Path(CHROMA_DIR) / "species_chunks.json"  #更改相应文件名
     cache_file.write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
 
     print(f"构建完成：{len(chunks)} 个文本块 -> {CHROMA_DIR}")
