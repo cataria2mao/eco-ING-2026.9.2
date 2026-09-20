@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>生态调查 Agent</title>
+<style>
+  body{font-family:-apple-system,"Microsoft YaHei",sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f7}
+  #chat{background:#fff;border-radius:12px;padding:16px;height:70vh;overflow-y:auto;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+  .msg{margin:12px 0;padding:10px 14px;border-radius:10px;max-width:85%;white-space:pre-wrap;word-wrap:break-word}
+  .user{background:#007aff;color:#fff;margin-left:auto}
+  .assistant{background:#e9e9eb}
+  .system{background:#fff3cd;font-size:13px;color:#664d03}
+  .tool{background:#d1ecf1;font-size:13px;color:#0c5460}
+  .error{background:#f8d7da;color:#721c24}
+  #form{display:flex;gap:8px;margin-top:12px}
+  #input{flex:1;padding:12px;border-radius:8px;border:1px solid #ccc;font-size:15px}
+  button{padding:10px 18px;border:none;border-radius:8px;background:#007aff;color:#fff;cursor:pointer;font-size:15px}
+  button:disabled{background:#aaa;cursor:not-allowed}
+  .interrupt-panel{background:#fff8e1;border:1px solid #ffcc00;border-radius:10px;padding:12px;margin-top:12px}
+  .interrupt-panel input{padding:4px 8px;border:1px solid #ccc;border-radius:4px;margin:4px}
+</style>
+</head>
+<body>
+<h2>生态环境调查 Agent</h2>
+<div id="chat"></div>
+<div id="interrupt-panel" class="interrupt-panel" style="display:none"></div>
+<form id="form">
+  <input id="input" placeholder="请输入..." autocomplete="off" autofocus />
+  <button type="submit" id="send">发送</button>
+</form>
+
+<script>
+const threadId = sessionStorage.getItem("tid") ||
+  (() => { const t = "web-" + Math.random().toString(36).slice(2,10); sessionStorage.setItem("tid", t); return t; })();
+
+const chat = document.getElementById("chat");
+const form = document.getElementById("form");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const interruptPanel = document.getElementById("interrupt-panel");
+
+let ws = null;
+
+function append(role, content, toolCalls) {
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  let text = content || "";
+  if (toolCalls && toolCalls.length) {
+    text += "\n🛠️ 工具: " + toolCalls.map(t => t.name).join(", ");
+  }
+  el.textContent = text;
+  chat.appendChild(el);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function setBusy(busy) {
+  sendBtn.disabled = busy;
+  input.disabled = busy;
+  if (!busy) input.focus();
+}
+
+function showInterrupt(payloads) {
+  interruptPanel.style.display = "block";
+  interruptPanel.innerHTML = "";
+  payloads.forEach(p => {
+    const box = document.createElement("div");
+    const type = p.type || "unknown";
+    let html = `<div><b>需要人工确认：${type}</b></div>`;
+
+    if (type === "missing_required_params") {
+      html += `<div>技能：${p.skill || ""}</div>`;
+      (p.missing_params || []).forEach(item => {
+        const name = item.name || item;
+        const desc = item.description || "";
+        html += `<div>- ${name}：${desc}
+          <input data-param="${name}" placeholder="留空=脚本默认"/></div>`;
+      });
+      html += `<button id="ip-provide">提供参数</button>
+               <button id="ip-default">使用默认参数</button>`;
+    } else if (type === "execution_error") {
+      html += `<div>错误：${p.error || ""}</div>`;
+      html += `<input id="ip-feedback" placeholder="修改建议（可选）" style="width:60%"/>
+               <button id="ip-retry">重试</button>
+               <button id="ip-abort">终止</button>`;
+    } else {
+      html += `<pre style="font-size:12px;max-height:200px;overflow:auto">${JSON.stringify(p,null,2)}</pre>
+               <button id="ip-approve">通过</button>
+               <button id="ip-retry">重新执行</button>
+               <button id="ip-abort">终止</button>`;
+    }
+    box.innerHTML = html;
+    interruptPanel.appendChild(box);
+
+    box.querySelectorAll("button").forEach(btn => {
+      btn.onclick = () => {
+        let resume = {};
+        if (btn.id === "ip-provide") {
+          const params = {};
+          box.querySelectorAll("input[data-param]").forEach(i => {
+            if (i.value.trim()) params[i.dataset.param] = i.value.trim();
+          });
+          resume = { action: "provide", params };
+        } else if (btn.id === "ip-default") {
+          resume = { action: "default" };
+        } else if (btn.id === "ip-approve") {
+          resume = { approved: true, action: "continue" };
+        } else if (btn.id === "ip-retry") {
+          const fb = box.querySelector("#ip-feedback");
+          resume = { approved: false, action: "retry", feedback: fb ? fb.value : "" };
+        } else if (btn.id === "ip-abort") {
+          resume = { approved: false, action: "abort" };
+        }
+        interruptPanel.style.display = "none";
+        interruptPanel.innerHTML = "";
+        setBusy(true);
+        ws.send(JSON.stringify({ kind: "resume", value: resume }));
+      };
+    });
+  });
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/${threadId}`);
+  ws.onopen = () => append("system", "已连接 · 会话 " + threadId);
+  ws.onclose = () => { append("system", "连接断开，重连中..."); setTimeout(connect, 2000); };
+  ws.onmessage = (evt) => {
+    const d = JSON.parse(evt.data);
+    if (d.type === "user") append("user", d.content);
+    else if (d.type === "update") append(d.message.role, d.message.content, d.message.tool_calls);
+    else if (d.type === "interrupt") showInterrupt(d.payload);
+    else if (d.type === "done") setBusy(false);
+    else if (d.type === "error") { append("error", d.content); setBusy(false); }
+  };
+}
+
+form.onsubmit = (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  input.value = "";
+  setBusy(true);
+  ws.send(JSON.stringify({ kind: "message", text }));
+};
+
+connect();
+</script>
+</body>
+</html>

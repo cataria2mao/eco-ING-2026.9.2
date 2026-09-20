@@ -1,0 +1,56 @@
+# ============================================================
+# 生态环境调查 Agent 项目 —— 依赖安装命令
+# 生成依据：web_server.py / subgraph_agent.py / PGstore.py
+#           build_vector_db.py / agent_core.py
+#
+# 使用方式（任选其一）：
+#   方式一：逐行复制到终端执行
+#   方式二：一次性执行本文件全部命令（Windows CMD）
+#           for /f "usebackq tokens=*" %i in ("install_packages.txt") do @echo %i
+#           （建议使用方式一，便于看清每一步结果）
+#   推荐先创建并激活虚拟环境：
+#           python -m venv .venv
+#           .venv\Scripts\activate
+# ============================================================
+
+
+# ---------- 1. Web 服务（web_server.py） ----------
+pip install fastapi
+pip install "uvicorn[standard]"
+pip install websockets
+
+# ---------- 2. LangGraph / LangChain 框架（agent_core.py, subgraph_agent.py） ----------
+pip install "langgraph>=1.0"
+pip install "langchain-core>=1.0"
+pip install "langchain-deepseek>=1.0"
+pip install langchain-text-splitters
+
+# ---------- 3. 向量数据库（build_vector_db.py, agent_core.py） ----------
+pip install "chromadb>=1.0"
+
+# ---------- 4. 数据处理与文件读写（PGstore.py, subgraph_agent.py） ----------
+pip install "pandas>=2.0"
+pip install "openpyxl>=3.0"
+pip install "python-docx>=1.0"
+pip install sqlalchemy
+pip install psycopg2-binary
+
+# ---------- 5. 环境变量与网络请求（agent_core.py, build_vector_db.py） ----------
+pip install "python-dotenv>=1.0"
+pip install "requests>=2.0"
+
+# ---------- 6. 重排序模型 BGE-Reranker（agent_core.py） ----------
+pip install "FlagEmbedding>=1.3.0"
+pip install huggingface_hub
+pip install torch
+
+# 说明：FlagEmbedding 会自动安装 transformers、sentence-transformers 等依赖；
+# 如需 GPU 版 PyTorch，请按显卡 CUDA 版本到 https://pytorch.org 选择对应安装命令，
+# 例如（CUDA 12.1）：
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+
+# ============================================================
+# 一次性安装全部依赖（等价于上面所有命令，可直接复制执行）
+# ============================================================
+pip install fastapi "uvicorn[standard]" websockets "langgraph>=1.0" "langchain-core>=1.0" "langchain-deepseek>=1.0" langchain-text-splitters "chromadb>=1.0" "pandas>=2.0" "openpyxl>=3.0" "python-docx>=1.0" sqlalchemy psycopg2-binary "python-dotenv>=1.0" "requests>=2.0" "FlagEmbedding>=1.3.0" huggingface_hub torch
