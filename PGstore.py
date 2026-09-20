@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 # 数据库连接字符串格式: postgresql://用户名:密码@主机:端口/数据库名
 # 请将下面的 'your_username', 'your_password', 'your_database' 替换为你的实际信息
 DB_USER = 'animal_agent'
-DB_PASSWORD = '010405'  # 替换为你的密码
+DB_PASSWORD = '000000'  # 替换为你的密码
 DB_HOST = 'localhost'
 DB_PORT = '5432'
 DB_NAME = 'animal_base_data'   # 你要导入的目标数据库
