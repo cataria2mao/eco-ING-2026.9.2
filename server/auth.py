@@ -9,7 +9,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, User
+from server.database import SessionLocal, User
 
 load_dotenv(override=True)
 

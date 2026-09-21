@@ -17,8 +17,8 @@ from contextlib import asynccontextmanager
 
 import agent_core
 from agent_core import KNOWLEDGE_BASES, init_agent   # 模型 / 技能导入时初始化，图在 startup 构建
-from database import Conversation, Message, SessionLocal, User
-from auth import (
+from server.database import Conversation, Message, SessionLocal, User
+from server.auth import (
     authenticate_ws_token,
     create_token,
     get_current_user,
