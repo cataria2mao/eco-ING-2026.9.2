@@ -3,7 +3,12 @@
 基于 [LangGraph](https://github.com/langchain-ai/langgraph) 的多智能体（多图）系统，面向陆生动物 / 陆生植物调查与生态环境评估场景（样线法调查、物种名录生成、多样性分析、报告撰写等），支持RAG，短、长期记忆，人机协同，工具调用：
 
 > **需求判断 →  任务路由  →混合检索or（领域子图规划 → 脚本执行（Python/R）） → 结果汇报**
-> <img width="1912" height="948" alt="image" src="https://github.com/user-attachments/assets/c1c77b23-5550-475e-b1cd-b4c32c40e028" />
+## 前端
+<img width="1912" height="948" alt="image" src="https://github.com/user-attachments/assets/c1c77b23-5550-475e-b1cd-b4c32c40e028" />
+
+## 后端
+<img width="1841" height="344" alt="image" src="https://github.com/user-attachments/assets/e31303af-8455-4c03-938c-84be624aad27" />
+
 
 
 核心设计思想（agent3.5）：
