@@ -1,4 +1,4 @@
-import os, json, re, math, threading, torch
+import os, json, re, math, threading, asyncio, sys, torch
 from dotenv import load_dotenv
 from pathlib import Path
 from typing import TypedDict, Optional, Any, List, Dict, Annotated
@@ -66,32 +66,128 @@ print(f"[SKILLS] 动物技能 {len(animal_skill_registry)} 个：{[s['id'] for s
 print(f"[SKILLS] 植物技能 {len(plant_skill_registry)} 个：{[s['id'] for s in plant_skill_registry]}")
 
 
-# ========== 编译两个子图==========
-checkpointer = MemorySaver()
+# ========== checkpointer / 子图 / 父图：延迟到事件循环内构建 ==========
+# Web 端使用 parent_graph.astream（异步），必须用 AsyncPostgresSaver；而它的构造函数
+# 需要 running event loop，不能在模块导入时创建。因此由 init_agent() 在服务启动
+# （或 CLI 进入交互）时构建；数据库不可用时回退内存 checkpointer。
+checkpointer = None
+_checkpointer_pool = None
+animal_base_work_agent = None
+plant_base_work_agent = None
+parent_graph = None
+_graph_init_lock = None
 
-animal_base_work_agent = build_base_work_agent(
-    request_key="animal_request",
-    result_key="animal_result",
-    domain="animal",
-    domain_label="陆生动物",
-    state_cls=AnimalAnalysisState,
-    registry=animal_skill_registry,
-    planner_llm=llm,
-    checkpointer=checkpointer,
-)
 
-plant_base_work_agent = build_base_work_agent(
-    request_key="plant_request",
-    result_key="plant_result",
-    domain="plant",
-    domain_label="陆生植物",
-    state_cls=PlantAnalysisState,
-    registry=plant_skill_registry,
-    planner_llm=llm,
-    checkpointer=checkpointer,
-)
+def _resolve_checkpoint_dsn() -> str:
+    dsn = os.getenv("PG_CHECKPOINT_DSN") or ""
+    if dsn:
+        return dsn
+    pg_dsn = os.getenv("PG_DSN", "")
+    if not pg_dsn:
+        return ""
+    # 去掉 SQLAlchemy 驱动前缀，换成 libpq 连接串
+    return (pg_dsn
+            .replace("postgresql+psycopg://", "postgresql://")
+            .replace("postgresql+psycopg2://", "postgresql://"))
 
-print("[GRAPH] animal_base_work_agent / plant_base_work_agent 已编译")
+
+def _pg_reachable(dsn: str, timeout: int = 4) -> bool:
+    """用同步连接探活，决定是否启用 PostgresSaver。"""
+    try:
+        import psycopg
+        with psycopg.connect(dsn, connect_timeout=timeout) as conn:
+            conn.execute("SELECT 1")
+        return True
+    except Exception as e:
+        print(f"[CKPT] 无法连接 PostgreSQL（{dsn.rsplit('@', 1)[-1]}）：{e}")
+        return False
+
+
+async def _create_checkpointer():
+    """在当前事件循环内创建 checkpointer；失败回退 MemorySaver。"""
+    global _checkpointer_pool
+    # Windows 默认 ProactorEventLoop，psycopg 异步模式不支持，提前给出明确提示
+    if sys.platform == "win32":
+        try:
+            if type(asyncio.get_running_loop()).__name__ == "ProactorEventLoop":
+                print("[CKPT] 检测到 Windows ProactorEventLoop，psycopg 异步不可用，"
+                      "回退内存 checkpointer；请使用 `python run_server.py` 启动以启用持久化。")
+                return MemorySaver()
+        except Exception:
+            pass
+    dsn = _resolve_checkpoint_dsn()
+    if not dsn:
+        print("[CKPT] 未配置 PG_DSN / PG_CHECKPOINT_DSN，使用内存 checkpointer（重启后上下文丢失）")
+        return MemorySaver()
+    if not _pg_reachable(dsn):
+        print("[CKPT] 回退内存 checkpointer（数据库不可用，服务仍可启动）")
+        return MemorySaver()
+    try:
+        from psycopg.rows import dict_row
+        from psycopg_pool import AsyncConnectionPool
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        _checkpointer_pool = AsyncConnectionPool(
+            conninfo=dsn,
+            min_size=1,
+            max_size=10,
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            open=False,
+        )
+        await _checkpointer_pool.open(wait=True, timeout=8)
+        saver = AsyncPostgresSaver(_checkpointer_pool)
+        await saver.setup()   # 幂等：创建 checkpoints / blobs / writes 等表
+        print(f"[CKPT] AsyncPostgresSaver 已启用（{dsn.rsplit('@', 1)[-1]}），检查点持久化生效")
+        return saver
+    except Exception as e:
+        print(f"[CKPT] AsyncPostgresSaver 初始化失败，回退内存 checkpointer：{e}")
+        if _checkpointer_pool is not None:
+            try:
+                await _checkpointer_pool.close()
+            except Exception:
+                pass
+            _checkpointer_pool = None
+        return MemorySaver()
+
+
+async def init_agent():
+    """在事件循环内构建 checkpointer + 子图 + 父图（幂等）。"""
+    global checkpointer, animal_base_work_agent, plant_base_work_agent, parent_graph, _graph_init_lock
+    if parent_graph is not None:
+        return
+    if _graph_init_lock is None:
+        _graph_init_lock = asyncio.Lock()
+    async with _graph_init_lock:
+        if parent_graph is not None:
+            return
+
+        checkpointer = await _create_checkpointer()
+
+        animal_base_work_agent = build_base_work_agent(
+            request_key="animal_request",
+            result_key="animal_result",
+            domain="animal",
+            domain_label="陆生动物",
+            state_cls=AnimalAnalysisState,
+            registry=animal_skill_registry,
+            planner_llm=llm,
+            checkpointer=checkpointer,
+        )
+
+        plant_base_work_agent = build_base_work_agent(
+            request_key="plant_request",
+            result_key="plant_result",
+            domain="plant",
+            domain_label="陆生植物",
+            state_cls=PlantAnalysisState,
+            registry=plant_skill_registry,
+            planner_llm=llm,
+            checkpointer=checkpointer,
+        )
+        print("[GRAPH] animal_base_work_agent / plant_base_work_agent 已编译")
+
+        parent_graph = _build_parent_graph()
+        print("[GRAPH] 父图已编译：需求判断 → (animal/plant 子图 或 知识库检索) → 汇报")
 
 
 # ============================================================
@@ -115,14 +211,14 @@ KNOWLEDGE_BASES: Dict[str, Dict[str, Any]] = {
         "collection": "sop_semantic",
         "chunks_file": "sop_chunks.json",
     },
-    # 预留：按需新增其它向量数据库，路由会自动识别
-    # "species": {
-    #     "label": "物种知识库",
-    #     "description": "陆生动物/植物物种名录、保护级别、居留型、生活习性等",
-    #     "chroma_dir": str(Path(__file__).resolve().parent / "chroma_species_db"),
-    #     "collection": "species_semantic",
-    #     "chunks_file": "species_chunks.json",
-    # },
+
+     "species": {
+         "label": "物种知识库",
+         "description": "陆生动物/植物物种名录、保护级别、居留型、生活习性等",
+         "chroma_dir": str(Path(__file__).resolve().parent / "chroma_species_db"),
+         "collection": "species_semantic",
+         "chunks_file": "species_chunks.json",
+     },
 }
 DEFAULT_KB = "sop"
 
@@ -299,7 +395,13 @@ def _get_retrievers(kb: str = DEFAULT_KB):
 _reranker = None
 _reranker_lock = threading.Lock()
 _RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") == "1"
+# 精排归一化分数阈值。低于该值视为“知识库无匹配内容”。
+# 经验值：bge-reranker-v2-m3 normalize=True 后 0.25~0.35 之间可作分水岭；
+# 0 表示关闭阈值。
+_RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.3"))
 
+# 精排不可用时用 BM25 最高分兜底过滤（BM25 无上界，只能拿经验值）
+_BM25_MIN_SCORE = float(os.getenv("BM25_MIN_SCORE", "0.0"))  # 0 表示不启用兜底
 
 client = InferenceClient(
     provider="hf-inference",
@@ -336,16 +438,43 @@ def _get_reranker():
 
 
 @lru_cache(maxsize=256)
-def _cached_rerank(query: str, doc_tuple: tuple):
-    """对 (query, 文档元组) 做缓存，文档元组用于做 key。"""
+def _cached_rerank_scored(query: str, doc_tuple: tuple):
+    """对 (query, 文档元组) 做缓存；返回 [(idx, score), ...]，按 score 降序。"""
     reranker = _get_reranker()
     if reranker is None:
-        return list(range(len(doc_tuple)))  # 退化：保持原序
+        # 退化：无法精排时，给所有候选 0 分，交由调用方按兜底逻辑处理
+        return [(i, 0.0) for i in range(len(doc_tuple))]
     pairs = [[query, d] for d in doc_tuple]
     scores = reranker.compute_score(pairs, normalize=True, batch_size=8)
     if not isinstance(scores, list):
         scores = [scores]
-    return sorted(range(len(doc_tuple)), key=lambda i: scores[i], reverse=True)
+    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    return ranked
+
+
+def _emit_retrieve_stage(kb: str, stage: str, **extra):
+    """把检索子阶段（混合检索 / RRF / 精排）通过 LangGraph custom stream 推出去。
+
+    仅在父图运行上下文内有效；在普通脚本调用（非图执行）时静默忽略。
+    """
+    try:
+        from langgraph.config import get_stream_writer
+        writer = get_stream_writer()
+    except Exception:
+        return
+    if not writer:
+        return
+    cfg = KNOWLEDGE_BASES.get(kb) or {}
+    try:
+        writer({
+            "__retrieve_stage__": True,
+            "kb": kb,
+            "label": cfg.get("label", kb),
+            "stage": stage,
+            **extra,
+        })
+    except Exception as e:
+        print(f"[VEC] 推送检索阶段事件失败({stage}): {e}")
 
 
 def retrieve_kb_chunks(kb: str, query: str, k: int = 5,
@@ -353,7 +482,11 @@ def retrieve_kb_chunks(kb: str, query: str, k: int = 5,
     """在指定知识库中混合检索：语义（DashScope）+ 关键词（BM25）→ RRF 融合 → BGE 精排。"""
     chunks = _load_chunks(kb)
     if not chunks:
+        _emit_retrieve_stage(kb, "empty")
         return []
+
+    # 阶段 1：混合检索（语义 + 关键词）
+    _emit_retrieve_stage(kb, "hybrid")
 
     sem, kw = _get_retrievers(kb)
     idx_of = {c: i for i, c in enumerate(chunks)}
@@ -376,18 +509,40 @@ def retrieve_kb_chunks(kb: str, query: str, k: int = 5,
     fused = _rrf_fuse([sem_rank, kw_rank])
     candidates = [chunks[i] for i in fused[:rerank_top_k]]
 
+    # 阶段 2：RRF 融合重排
+    _emit_retrieve_stage(kb, "rrf", candidates=len(candidates))
+
     # 若重排序不可用或候选太少，直接返回 RRF 结果
     if not _RERANK_ENABLED or len(candidates) <= k:
         return candidates[:k]
 
+    # 阶段 3：Cross-Encoder 精排（模型加载可能较慢，先发事件）
+    _emit_retrieve_stage(kb, "rerank", candidates=len(candidates))
     reranker = _get_reranker()
     if reranker is None:
+        # 精排模型未加载：退回 BM25 兜底逻辑（同上）
+        if _BM25_MIN_SCORE > 0 and kw_rank:
+            qt = kw._tokenize(query)
+            top_bm25 = max(kw._score(qt, i) for i in kw_rank)
+            if top_bm25 < _BM25_MIN_SCORE:
+                _emit_retrieve_stage(kb, "no_match", top_score=round(top_bm25, 3))
+                return []
         return candidates[:k]
 
-    # 精排阶段：批量打分（内部按 batch 自动切分）
     try:
-        order = _cached_rerank(query, tuple(candidates))
-        return [candidates[i] for i in order[:k]]
+        ranked = _cached_rerank_scored(query, tuple(candidates))
+        top_score = ranked[0][1] if ranked else 0.0
+
+        # 阈值闸门：低于阈值 → 认为知识库无匹配内容
+        if _RERANK_MIN_SCORE > 0 and top_score < _RERANK_MIN_SCORE:
+            print(f"[VEC] 知识库[{kb}] 无匹配内容：最高精排分 {top_score:.3f} < 阈值 {_RERANK_MIN_SCORE}")
+            _emit_retrieve_stage(kb, "no_match", top_score=round(top_score, 3))
+            return []
+
+        # 逐条过滤，防止“最高分过了但尾部是噪声”污染上下文
+        kept = [candidates[i] for i, s in ranked
+                if (_RERANK_MIN_SCORE <= 0 or s >= _RERANK_MIN_SCORE)]
+        return kept[:k]
 
     except torch.cuda.OutOfMemoryError:
         print("[RERANK] CUDA OOM，清空缓存并退化为 RRF 结果")
@@ -703,58 +858,58 @@ def parent_chat_router(state):
 
 # ---------- 构建父图 ----------
 
-parent_builder = StateGraph(ParentState)
+def _build_parent_graph():
+    """构建并编译父图（依赖 init_agent() 内已创建的 checkpointer 与两个子图）。"""
+    builder = StateGraph(ParentState)
 
-parent_builder.add_node("parent_retrieve", parent_retrieve_node)
-parent_builder.add_node("parent_router", parent_router_node)
-parent_builder.add_node("parent_dispatch", parent_dispatch_node)
-parent_builder.add_node("parent_report", parent_report_node)
-parent_builder.add_node("parent_chat", parent_chat_node)
-parent_builder.add_node("parent_tools", parent_tool_node)
-parent_builder.add_node("animal_base_work_agent", animal_base_work_agent)
-parent_builder.add_node("plant_base_work_agent", plant_base_work_agent)
+    builder.add_node("parent_retrieve", parent_retrieve_node)
+    builder.add_node("parent_router", parent_router_node)
+    builder.add_node("parent_dispatch", parent_dispatch_node)
+    builder.add_node("parent_report", parent_report_node)
+    builder.add_node("parent_chat", parent_chat_node)
+    builder.add_node("parent_tools", parent_tool_node)
+    builder.add_node("animal_base_work_agent", animal_base_work_agent)
+    builder.add_node("plant_base_work_agent", plant_base_work_agent)
 
-# 需求判断（入口）
-parent_builder.add_edge(START, "parent_router")
+    # 需求判断（入口）
+    builder.add_edge(START, "parent_router")
 
-# 需求判断 → 分发子图 / 检索知识库 / 直接回答
-parent_builder.add_conditional_edges("parent_router", parent_router_router, {
-    "dispatch": "parent_dispatch",
-    "retrieve": "parent_retrieve",
-    "chat": "parent_chat",
-})
+    # 需求判断 → 分发子图 / 检索知识库 / 直接回答
+    builder.add_conditional_edges("parent_router", parent_router_router, {
+        "dispatch": "parent_dispatch",
+        "retrieve": "parent_retrieve",
+        "chat": "parent_chat",
+    })
 
-# 知识库检索 → 对话层简述回答
-parent_builder.add_edge("parent_retrieve", "parent_chat")
+    # 知识库检索 → 对话层简述回答
+    builder.add_edge("parent_retrieve", "parent_chat")
 
-# 分发 → 对应子图（一次只委派一个领域）
-parent_builder.add_conditional_edges("parent_dispatch", parent_dispatch_router, {
-    "animal_base_work_agent": "animal_base_work_agent",
-    "plant_base_work_agent": "plant_base_work_agent",
-    "parent_chat": "parent_chat",
-})
+    # 分发 → 对应子图（一次只委派一个领域）
+    builder.add_conditional_edges("parent_dispatch", parent_dispatch_router, {
+        "animal_base_work_agent": "animal_base_work_agent",
+        "plant_base_work_agent": "plant_base_work_agent",
+        "parent_chat": "parent_chat",
+    })
 
-# 子图 → 汇总汇报 → 对话层
-parent_builder.add_edge("animal_base_work_agent", "parent_report")
-parent_builder.add_edge("plant_base_work_agent", "parent_report")
-parent_builder.add_edge("parent_report", "parent_chat")
+    # 子图 → 汇总汇报 → 对话层
+    builder.add_edge("animal_base_work_agent", "parent_report")
+    builder.add_edge("plant_base_work_agent", "parent_report")
+    builder.add_edge("parent_report", "parent_chat")
 
-# 对话层（工具循环）
-parent_builder.add_conditional_edges("parent_chat", parent_chat_router, {
-    "tools": "parent_tools",
-    "respond": END,
-})
-parent_builder.add_edge("parent_tools", "parent_chat")
+    # 对话层（工具循环）
+    builder.add_conditional_edges("parent_chat", parent_chat_router, {
+        "tools": "parent_tools",
+        "respond": END,
+    })
+    builder.add_edge("parent_tools", "parent_chat")
 
-parent_graph = parent_builder.compile(checkpointer=checkpointer)
-
-print("[GRAPH] 父图已编译：需求判断 → (animal/plant 子图 或 知识库检索) → 汇报")
+    return builder.compile(checkpointer=checkpointer)
 
 
 # ========== 主入口测试 ==========
-def _print_last_ai_message(agent, config):
+async def _print_last_ai_message(agent, config):
     """输出最后一条 AI 消息"""
-    state = agent.get_state(config)
+    state = await agent.aget_state(config)
     messages = state.values.get("messages", [])
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
@@ -767,9 +922,9 @@ def _print_last_ai_message(agent, config):
             return
 
 
-def _handle_interrupts(agent, config):
+async def _handle_interrupts(agent, config):
     """检查并处理图中的 interrupt 状态（人工审核/失败中断）"""
-    state = agent.get_state(config)
+    state = await agent.aget_state(config)
     for task in state.tasks:
         if not (hasattr(task, 'interrupts') and task.interrupts):
             continue
@@ -786,13 +941,13 @@ def _handle_interrupts(agent, config):
                     desc = item.get("description", "") if isinstance(item, dict) else ""
                     print(f"  - {name}：{desc}")
                 while True:
-                    choice = input("请选择 (提供参数/默认参数): ").strip().lower()
+                    choice = (await asyncio.to_thread(input, "请选择 (提供参数/默认参数): ")).strip().lower()
                     if choice in ("提供参数", "提供", "provide", "p"):
                         provided = {}
                         for item in missing:
                             name = item.get("name") if isinstance(item, dict) else str(item)
                             desc = item.get("description", "") if isinstance(item, dict) else ""
-                            val = input(f"请输入 {name}（{desc}）[直接回车=使用脚本默认参数]: ").strip()
+                            val = (await asyncio.to_thread(input, f"请输入 {name}（{desc}）[直接回车=使用脚本默认参数]: ")).strip()
                             if val:
                                 provided[name] = val
                         resume_value = {"action": "provide", "params": provided}
@@ -805,9 +960,9 @@ def _handle_interrupts(agent, config):
             elif interrupt_value.get("type") == "execution_error":
                 print(f"错误详情: {interrupt_value.get('error')}")
                 while True:
-                    choice = input("请选择 (重试/终止): ").strip().lower()
+                    choice = (await asyncio.to_thread(input, "请选择 (重试/终止): ")).strip().lower()
                     if choice in ("重试", "retry"):
-                        feedback = input("请输入修改建议（可选）: ").strip()
+                        feedback = (await asyncio.to_thread(input, "请输入修改建议（可选）: ")).strip()
                         resume_value = {"approved": False, "action": "retry", "feedback": feedback}
                         break
                     elif choice in ("终止", "abort"):
@@ -817,12 +972,12 @@ def _handle_interrupts(agent, config):
                         print("无效输入，请输入: 重试 或 终止")
             else:
                 while True:
-                    action_input = input("\n请选择操作 (通过/重新执行/终止): ").strip()
+                    action_input = (await asyncio.to_thread(input, "\n请选择操作 (通过/重新执行/终止): ")).strip()
                     if action_input in ("通过", "approve", "continue"):
                         resume_value = {"approved": True, "action": "continue"}
                         break
                     elif action_input in ("重新执行", "retry"):
-                        feedback = input("请输入修改建议（可选）: ").strip()
+                        feedback = (await asyncio.to_thread(input, "请输入修改建议（可选）: ")).strip()
                         resume_value = {"approved": False, "action": "retry", "feedback": feedback}
                         break
                     elif action_input in ("终止", "abort"):
@@ -832,16 +987,17 @@ def _handle_interrupts(agent, config):
                         print("无效输入，请选择: 通过 / 重新执行 / 终止")
 
             # 恢复执行
-            for _ in agent.stream(Command(resume=resume_value), config=config, stream_mode="values"):
+            async for _ in agent.astream(Command(resume=resume_value), config=config, stream_mode="values"):
                 pass
 
             # 恢复后可能还有新的 interrupt，递归处理
-            _handle_interrupts(agent, config)
+            await _handle_interrupts(agent, config)
             return
 
 
-def run_interactive():
+async def run_interactive():
     """交互式运行"""
+    await init_agent()
     config = {"configurable": {"thread_id": "interactive-1"}}
 
     print("=" * 60)
@@ -854,7 +1010,7 @@ def run_interactive():
     print("=" * 60)
 
     while True:
-        user_input = input("\n🧑 你: ").strip()
+        user_input = (await asyncio.to_thread(input, "\n🧑 你: ")).strip()
         if user_input.lower() in ("quit", "exit", "q"):
             print("再见！")
             break
@@ -867,7 +1023,7 @@ def run_interactive():
 
         try:
             step_count = 0
-            for event in parent_graph.stream(initial_state, config=config, stream_mode="values"):
+            async for event in parent_graph.astream(initial_state, config=config, stream_mode="values"):
                 step_count += 1
                 msgs = event.get("messages", [])
                 if msgs:
@@ -889,14 +1045,22 @@ def run_interactive():
                     print(f"  [STEP {step_count}] {role}: {content}")
 
             # 检查是否有 pending interrupt（人工审核）
-            _handle_interrupts(parent_graph, config)
+            await _handle_interrupts(parent_graph, config)
 
             # 输出最后一条 AI 消息
-            _print_last_ai_message(parent_graph, config)
+            await _print_last_ai_message(parent_graph, config)
 
         except Exception as e:
             print(f"\n❌ 执行出错: {e}")
 
 
 if __name__ == "__main__":
-    run_interactive()
+    # Windows 下 asyncio 默认是 ProactorEventLoop，psycopg 异步不可用，改用 Selector。
+    if sys.platform == "win32":
+        try:
+            asyncio.run(run_interactive(), loop_factory=asyncio.SelectorEventLoop)
+        except TypeError:   # Python < 3.12 不支持 loop_factory
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            asyncio.run(run_interactive())
+    else:
+        asyncio.run(run_interactive())

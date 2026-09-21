@@ -2,55 +2,545 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>生态调查 Agent</title>
 <style>
-  body{font-family:-apple-system,"Microsoft YaHei",sans-serif;max-width:900px;margin:0 auto;padding:20px;background:#f5f5f7}
-  #chat{background:#fff;border-radius:12px;padding:16px;height:70vh;overflow-y:auto;box-shadow:0 2px 8px rgba(0,0,0,.06)}
-  .msg{margin:12px 0;padding:10px 14px;border-radius:10px;max-width:85%;white-space:pre-wrap;word-wrap:break-word}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,"Microsoft YaHei",sans-serif;margin:0;background:#f5f5f7;height:100vh;overflow:hidden}
+
+  /* ================= 登录 / 注册 ================= */
+  .auth-overlay{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
+                background:linear-gradient(135deg,#1f2a44,#2c4a7c 60%,#3b82f6)}
+  .auth-card{background:#fff;padding:28px 28px 22px;border-radius:16px;width:min(92vw,360px);
+             box-shadow:0 18px 50px rgba(0,0,0,.35)}
+  .auth-card h2{margin:0 0 4px;font-size:20px}
+  .auth-card p.sub{margin:0 0 16px;color:#777;font-size:13px}
+  .auth-card input{width:100%;padding:11px 12px;margin:6px 0;border:1px solid #ccd;border-radius:8px;font-size:14px}
+  .auth-card input:focus{outline:none;border-color:#3b82f6}
+  .auth-card button.primary{width:100%;padding:11px;margin-top:12px;border:none;border-radius:8px;
+             background:#007aff;color:#fff;font-size:15px;cursor:pointer}
+  .auth-card .switch{text-align:center;font-size:13px;color:#007aff;margin-top:14px;cursor:pointer;user-select:none}
+  .auth-err{color:#c0392b;font-size:13px;min-height:18px;margin-top:8px;text-align:center}
+
+  /* ================= 应用布局 ================= */
+  #app{display:none;height:100vh}
+  #sidebar{width:268px;flex:0 0 268px;background:#1f2430;color:#e8eaf0;display:flex;flex-direction:column;height:100vh}
+  .side-head{padding:14px 14px 10px}
+  .brand{font-weight:700;font-size:15px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+  #new-chat{width:100%;padding:10px;border:none;border-radius:8px;background:#3b82f6;color:#fff;
+            cursor:pointer;font-size:14px;font-weight:600}
+  #new-chat:hover{background:#2f6fe0}
+  .list-label{padding:6px 16px 4px;font-size:11px;letter-spacing:.08em;color:#7d8698;text-transform:uppercase}
+  #conv-list{flex:1;overflow-y:auto;padding:0 8px 8px}
+  .conv{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:10px 12px;
+        border-radius:8px;cursor:pointer;font-size:13px;color:#c7ccd8;margin-bottom:4px}
+  .conv:hover{background:#2b3140}
+  .conv.active{background:#3b82f6;color:#fff}
+  .conv .title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .conv .del{opacity:0;border:none;background:transparent;color:inherit;cursor:pointer;font-size:15px;
+             line-height:1;padding:0 2px;flex:0 0 auto}
+  .conv:hover .del{opacity:.75}
+  .side-foot{padding:12px 14px;border-top:1px solid #2b3140;display:flex;justify-content:space-between;
+             align-items:center;gap:8px;font-size:13px}
+  .side-foot .who{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dfe3ee}
+  #logout{border:none;background:#3a4152;color:#dfe3ee;padding:6px 10px;border-radius:6px;cursor:pointer;flex:0 0 auto}
+  #logout:hover{background:#4a5266}
+
+  main{flex:1;display:flex;flex-direction:column;padding:16px;min-width:0;height:100vh}
+  #chat{flex:1;background:#fff;border-radius:12px;padding:16px;overflow-y:auto;box-shadow:0 2px 8px rgba(0,0,0,.06)}
+  .msg{margin:12px 0;padding:10px 14px;border-radius:10px;max-width:85%;white-space:pre-wrap;
+       word-wrap:break-word;line-height:1.6}
   .user{background:#007aff;color:#fff;margin-left:auto}
   .assistant{background:#e9e9eb}
   .system{background:#fff3cd;font-size:13px;color:#664d03}
   .tool{background:#d1ecf1;font-size:13px;color:#0c5460}
   .error{background:#f8d7da;color:#721c24}
+
+  .msg.typing::after{content:"▍";margin-left:2px;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  .notice{margin:8px 0;padding:8px 12px;border-radius:8px;font-size:13px;line-height:1.7;
+          background:#eef4ff;color:#2c4a7c;border-left:3px solid #4a7fd1}
+  .notice .sub{opacity:.72;font-size:12px}
+  .notice.route{background:#f0ecff;color:#4a3b8f;border-left-color:#7a67d1}
+  .notice.retrieve{background:#fff4e5;color:#8a5200;border-left-color:#e08c1a}
+  .notice.dispatch{background:#e8f7ee;color:#1f6b3f;border-left-color:#2e9e63}
+  .notice .spinner{display:inline-block;width:11px;height:11px;margin-right:5px;
+          border:2px solid rgba(224,140,26,.28);border-top-color:#e08c1a;border-radius:50%;
+          vertical-align:-1px;animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
   #form{display:flex;gap:8px;margin-top:12px}
   #input{flex:1;padding:12px;border-radius:8px;border:1px solid #ccc;font-size:15px}
   button{padding:10px 18px;border:none;border-radius:8px;background:#007aff;color:#fff;cursor:pointer;font-size:15px}
   button:disabled{background:#aaa;cursor:not-allowed}
   .interrupt-panel{background:#fff8e1;border:1px solid #ffcc00;border-radius:10px;padding:12px;margin-top:12px}
   .interrupt-panel input{padding:4px 8px;border:1px solid #ccc;border-radius:4px;margin:4px}
+  #empty-tip{color:#999;text-align:center;margin-top:40px;font-size:14px}
 </style>
 </head>
 <body>
-<h2>生态环境调查 Agent</h2>
-<div id="chat"></div>
-<div id="interrupt-panel" class="interrupt-panel" style="display:none"></div>
-<form id="form">
-  <input id="input" placeholder="请输入..." autocomplete="off" autofocus />
-  <button type="submit" id="send">发送</button>
-</form>
+
+<!-- ================= 登录 / 注册 ================= -->
+<div id="auth" class="auth-overlay" style="display:none">
+  <form class="auth-card" id="auth-form">
+    <h2 id="auth-title">登录</h2>
+    <p class="sub" id="auth-sub">登录后即可保存你的对话记录</p>
+    <input id="auth-user" placeholder="用户名" autocomplete="username" />
+    <input id="auth-pass" type="password" placeholder="密码" autocomplete="current-password" />
+    <button class="primary" type="submit" id="auth-submit">登录</button>
+    <div class="auth-err" id="auth-err"></div>
+    <div class="switch" id="auth-switch">没有账号？去注册</div>
+  </form>
+</div>
+
+<!-- ================= 应用 ================= -->
+<div id="app">
+  <aside id="sidebar">
+    <div class="side-head">
+      <div class="brand">🌿 生态调查 Agent</div>
+      <button id="new-chat">＋ 新对话</button>
+    </div>
+    <div class="list-label">对话历史</div>
+    <div id="conv-list"></div>
+    <div class="side-foot">
+      <span class="who" id="user-name"></span>
+      <button id="logout">退出</button>
+    </div>
+  </aside>
+
+  <main>
+    <div id="chat"><div id="empty-tip">开始你的第一个问题吧～</div></div>
+    <div id="interrupt-panel" class="interrupt-panel" style="display:none"></div>
+    <form id="form">
+      <input id="input" placeholder="请输入..." autocomplete="off" autofocus />
+      <button type="submit" id="send">发送</button>
+    </form>
+  </main>
+</div>
 
 <script>
-const threadId = sessionStorage.getItem("tid") ||
-  (() => { const t = "web-" + Math.random().toString(36).slice(2,10); sessionStorage.setItem("tid", t); return t; })();
+/* ============================================================
+ * 全局状态
+ * ============================================================ */
+let token = localStorage.getItem("token") || "";
+let currentUser = null;
+let conversations = [];
+let currentConv = null;
+let ws = null;
+let connectSeq = 0;
 
+const authEl = document.getElementById("auth");
+const authForm = document.getElementById("auth-form");
+const authTitle = document.getElementById("auth-title");
+const authSub = document.getElementById("auth-sub");
+const authUser = document.getElementById("auth-user");
+const authPass = document.getElementById("auth-pass");
+const authSubmit = document.getElementById("auth-submit");
+const authErr = document.getElementById("auth-err");
+const authSwitch = document.getElementById("auth-switch");
+
+const appEl = document.getElementById("app");
 const chat = document.getElementById("chat");
 const form = document.getElementById("form");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
 const interruptPanel = document.getElementById("interrupt-panel");
+const convList = document.getElementById("conv-list");
+const userNameEl = document.getElementById("user-name");
+const newChatBtn = document.getElementById("new-chat");
+const logoutBtn = document.getElementById("logout");
 
-let ws = null;
+/* ============================================================
+ * HTTP 封装
+ * ============================================================ */
+async function api(path, opts) {
+  opts = opts || {};
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  let data = null;
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    const detail = data && (data.detail || data.message);
+    throw new Error(typeof detail === "string" ? detail : ("请求失败 (" + res.status + ")"));
+  }
+  return data;
+}
 
-function append(role, content, toolCalls) {
+/* ============================================================
+ * 认证界面
+ * ============================================================ */
+let authMode = "login";
+
+function setAuthMode(mode) {
+  authMode = mode;
+  const login = mode === "login";
+  authTitle.textContent = login ? "登录" : "注册";
+  authSub.textContent = login ? "登录后即可保存你的对话记录" : "创建一个账号，开始保存对话记录";
+  authSubmit.textContent = login ? "登录" : "注册";
+  authSwitch.textContent = login ? "没有账号？去注册" : "已有账号？去登录";
+  authPass.autocomplete = login ? "current-password" : "new-password";
+  authErr.textContent = "";
+}
+
+authSwitch.onclick = () => setAuthMode(authMode === "login" ? "register" : "login");
+
+authForm.onsubmit = async (e) => {
+  e.preventDefault();
+  const username = authUser.value.trim();
+  const password = authPass.value;
+  authErr.textContent = "";
+  if (!username || !password) { authErr.textContent = "请输入用户名和密码"; return; }
+  authSubmit.disabled = true;
+  try {
+    const data = await api("/api/" + (authMode === "login" ? "login" : "register"), {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+    token = data.token;
+    localStorage.setItem("token", token);
+    currentUser = data.user;
+    authPass.value = "";
+    await enterApp();
+  } catch (err) {
+    authErr.textContent = err.message;
+  } finally {
+    authSubmit.disabled = false;
+  }
+};
+
+function logout() {
+  token = "";
+  currentUser = null;
+  localStorage.removeItem("token");
+  if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} ws = null; }
+  conversations = [];
+  currentConv = null;
+  chat.innerHTML = "";
+  appEl.style.display = "none";
+  setAuthMode("login");
+  authEl.style.display = "flex";
+}
+logoutBtn.onclick = logout;
+
+/* ============================================================
+ * 进入应用 / 会话列表
+ * ============================================================ */
+async function enterApp() {
+  authEl.style.display = "none";
+  appEl.style.display = "flex";
+  userNameEl.textContent = currentUser.display_name || currentUser.username;
+  await loadConversations();
+  if (conversations.length) openConversation(conversations[0]);
+  else await newConversation();
+}
+
+async function loadConversations() {
+  conversations = await api("/api/conversations");
+  renderConversations();
+}
+
+function renderConversations() {
+  convList.innerHTML = "";
+  if (!conversations.length) {
+    const tip = document.createElement("div");
+    tip.style.cssText = "padding:12px;color:#7d8698;font-size:12px";
+    tip.textContent = "暂无历史对话";
+    convList.appendChild(tip);
+    return;
+  }
+  conversations.forEach(c => {
+    const el = document.createElement("div");
+    el.className = "conv" + (currentConv && currentConv.id === c.id ? " active" : "");
+    el.title = c.title || "新会话";
+
+    const span = document.createElement("span");
+    span.className = "title";
+    span.textContent = c.title || "新会话";
+
+    const del = document.createElement("button");
+    del.className = "del";
+    del.textContent = "×";
+    del.title = "删除会话";
+    del.onclick = (ev) => { ev.stopPropagation(); removeConversation(c); };
+
+    el.appendChild(span);
+    el.appendChild(del);
+    el.onclick = () => openConversation(c);
+    el.ondblclick = () => renameConversation(c);
+    convList.appendChild(el);
+  });
+}
+
+async function newConversation() {
+  const conv = await api("/api/conversations", { method: "POST" });
+  conversations.unshift(conv);
+  renderConversations();
+  openConversation(conv);
+}
+newChatBtn.onclick = () => { newConversation().catch(e => alert(e.message)); };
+
+async function removeConversation(c) {
+  if (!confirm('删除会话「' + (c.title || "新会话") + '」？此操作不可恢复。')) return;
+  try {
+    await api("/api/conversations/" + c.id, { method: "DELETE" });
+  } catch (e) { alert(e.message); return; }
+  conversations = conversations.filter(x => x.id !== c.id);
+  if (currentConv && currentConv.id === c.id) {
+    currentConv = null;
+    if (conversations.length) openConversation(conversations[0]);
+    else await newConversation();
+  } else {
+    renderConversations();
+  }
+}
+
+async function renameConversation(c) {
+  const t = prompt("重命名会话", c.title || "新会话");
+  if (t == null) return;
+  const title = t.trim();
+  if (!title) return;
+  try {
+    const updated = await api("/api/conversations/" + c.id, {
+      method: "PATCH", body: JSON.stringify({ title }),
+    });
+    Object.assign(c, updated);
+    if (currentConv && currentConv.id === c.id) currentConv = c;
+    renderConversations();
+  } catch (e) { alert(e.message); }
+}
+
+function openConversation(conv) {
+  currentConv = conv;
+  renderConversations();
+  chat.innerHTML = "";
+  retrieveNotice = null;
+  interruptPanel.style.display = "none";
+  interruptPanel.innerHTML = "";
+  connectWS(conv.thread_id);
+}
+
+/* ============================================================
+ * WebSocket
+ * ============================================================ */
+function connectWS(threadId) {
+  const seq = ++connectSeq;
+  if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${proto}://${location.host}/ws/${encodeURIComponent(threadId)}?token=${encodeURIComponent(token)}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => { if (seq === connectSeq) setBusy(false); };
+
+  ws.onclose = (evt) => {
+    if (seq !== connectSeq) return;
+    if (evt.code === 4401 || evt.code === 4404) {
+      logout();
+      alert(evt.code === 4401 ? "登录已失效，请重新登录" : "会话不存在或无权访问");
+      return;
+    }
+    append("system", "连接断开，重连中...");
+    setTimeout(() => { if (seq === connectSeq) connectWS(threadId); }, 2000);
+  };
+
+  ws.onmessage = (evt) => {
+    if (seq !== connectSeq) return;
+    let d;
+    try { d = JSON.parse(evt.data); } catch (e) { return; }
+
+    switch (d.type) {
+      case "user":
+        retrieveNotice = null;
+        append("user", d.content);
+        break;
+
+      case "update": {
+        const m = d.message || {};
+        const animate = m.role === "assistant" && !d.replay;
+        append(m.role, m.content, m.tool_calls, { animate });
+        break;
+      }
+
+      case "conversation": {
+        const c = d.conversation;
+        if (!c) break;
+        const idx = conversations.findIndex(x => x.id === c.id);
+        if (idx >= 0) conversations[idx] = c; else conversations.unshift(c);
+        conversations.sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+        if (currentConv && currentConv.id === c.id) currentConv = c;
+        renderConversations();
+        break;
+      }
+
+      case "route":
+        showRoute(d);
+        break;
+
+      case "retrieve":
+        showRetrieve(d);
+        break;
+
+      case "retrieve_stage":
+        showRetrieveStage(d);
+        break;
+
+      case "dispatch":
+        showDispatch(d);
+        break;
+
+      case "interrupt":
+        showInterrupt(d.payload);
+        break;
+
+      case "done":
+        renderChain.then(() => setBusy(false));
+        break;
+
+      case "error":
+        append("error", d.content);
+        renderChain.then(() => setBusy(false));
+        break;
+    }
+  };
+}
+
+/* ============================================================
+ * 渲染队列：保证消息顺序与打字机动画串行
+ * ============================================================ */
+let renderChain = Promise.resolve();
+function enqueue(task) {
+  renderChain = renderChain.then(task).catch(err => console.error(err));
+  return renderChain;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]
+  ));
+}
+
+function scrollBottom() { chat.scrollTop = chat.scrollHeight; }
+
+function typeInto(el, text) {
+  return new Promise(resolve => {
+    const total = text.length;
+    if (!total) { el.classList.remove("typing"); resolve(); return; }
+    const duration = Math.min(1400, Math.max(240, total * 10));
+    const t0 = performance.now();
+    const frame = (now) => {
+      const p = Math.min(1, (now - t0) / duration);
+      el.textContent = text.slice(0, Math.floor(p * total));
+      scrollBottom();
+      if (p < 1) {
+        requestAnimationFrame(frame);
+      } else {
+        el.textContent = text;
+        el.classList.remove("typing");
+        scrollBottom();
+        resolve();
+      }
+    };
+    requestAnimationFrame(frame);
+  });
+}
+
+function append(role, content, toolCalls, opts) {
+  opts = opts || {};
+  const tip = document.getElementById("empty-tip");
+  if (tip) tip.remove();
+
   const el = document.createElement("div");
   el.className = "msg " + role;
-  let text = content || "";
+
+  let text = content == null ? "" : String(content);
   if (toolCalls && toolCalls.length) {
     text += "\n🛠️ 工具: " + toolCalls.map(t => t.name).join(", ");
   }
+
+  if (opts.animate) {
+    el.classList.add("typing");
+    chat.appendChild(el);
+    scrollBottom();
+    return enqueue(() => typeInto(el, text));
+  }
+
   el.textContent = text;
   chat.appendChild(el);
-  chat.scrollTop = chat.scrollHeight;
+  scrollBottom();
+  return Promise.resolve();
+}
+
+/* ============================================================
+ * 节点事件提示条
+ * ============================================================ */
+function notice(html, cls) {
+  const el = document.createElement("div");
+  el.className = "notice " + (cls || "");
+  el.innerHTML = html;
+  chat.appendChild(el);
+  scrollBottom();
+}
+
+function showRoute(d) {
+  const map = { animal: "陆生动物数据分析", plant: "陆生植物数据分析", chat: "一般问答" };
+  const reason = d.reason ? ` <span class="sub">（${escapeHtml(d.reason)}）</span>` : "";
+  notice(`🧭 需求判断：<b>${map[d.route] || escapeHtml(d.route)}</b>${reason}`, "route");
+}
+
+function showRetrieve(d) {
+  const html =
+    `🔍 查询数据库：<b>${escapeHtml(d.label || d.kb)}</b>` +
+    ` <span class="sub">[${escapeHtml(d.kb)}]</span>` +
+    ` — 检索到 <b>${d.count}</b> 条相关资料`;
+  if (retrieveNotice && retrieveNotice.isConnected) {
+    retrieveNotice.innerHTML = html;
+    retrieveNotice = null;
+  } else {
+    notice(html, "retrieve");
+  }
+  scrollBottom();
+}
+
+const RETRIEVE_STAGE_TEXT = {
+  hybrid: "正在混合检索（语义向量 + 关键词 BM25）…",
+  rrf: "正在 RRF 融合重排…",
+  rerank: "正在 Cross-Encoder 精排…",
+  empty: "该知识库暂无可检索内容",
+};
+let retrieveNotice = null;
+
+function showRetrieveStage(d) {
+  const label = escapeHtml(d.label || d.kb);
+  const kbTag = `<span class="sub">[${escapeHtml(d.kb)}]</span>`;
+  let extra = "";
+  if (d.stage === "rrf" && d.candidates != null) {
+    extra = ` <span class="sub">（融合候选 ${d.candidates} 条）</span>`;
+  } else if (d.stage === "rerank" && d.candidates != null) {
+    extra = ` <span class="sub">（对 ${d.candidates} 条候选打分）</span>`;
+  }
+  const stageText = RETRIEVE_STAGE_TEXT[d.stage] || `处理中（${escapeHtml(d.stage)}）…`;
+  const spinner = d.stage === "empty" ? "" : `<span class="spinner"></span>`;
+  const html = `${spinner}🗂️ 检索数据库：<b>${label}</b> ${kbTag} — ${stageText}${extra}`;
+
+  if (retrieveNotice && retrieveNotice.isConnected) {
+    retrieveNotice.innerHTML = html;
+  } else {
+    retrieveNotice = document.createElement("div");
+    retrieveNotice.className = "notice retrieve";
+    retrieveNotice.innerHTML = html;
+    chat.appendChild(retrieveNotice);
+  }
+  scrollBottom();
+}
+
+function showDispatch(d) {
+  const task = (d.task || "").replace(/\s+/g, " ").slice(0, 120);
+  notice(
+    `🔀 任务已分配至子代理 <b>${escapeHtml(d.agent)}</b>（${escapeHtml(d.label)}）` +
+    `<br><span class="sub">任务：${escapeHtml(task)}${(d.task || "").length > 120 ? "…" : ""}</span>`,
+    "dispatch"
+  );
 }
 
 function setBusy(busy) {
@@ -59,6 +549,9 @@ function setBusy(busy) {
   if (!busy) input.focus();
 }
 
+/* ============================================================
+ * 人工确认面板
+ * ============================================================ */
 function showInterrupt(payloads) {
   interruptPanel.style.display = "block";
   interruptPanel.innerHTML = "";
@@ -83,7 +576,7 @@ function showInterrupt(payloads) {
                <button id="ip-retry">重试</button>
                <button id="ip-abort">终止</button>`;
     } else {
-      html += `<pre style="font-size:12px;max-height:200px;overflow:auto">${JSON.stringify(p,null,2)}</pre>
+      html += `<pre style="font-size:12px;max-height:200px;overflow:auto">${JSON.stringify(p, null, 2)}</pre>
                <button id="ip-approve">通过</button>
                <button id="ip-retry">重新执行</button>
                <button id="ip-abort">终止</button>`;
@@ -113,27 +606,17 @@ function showInterrupt(payloads) {
         interruptPanel.style.display = "none";
         interruptPanel.innerHTML = "";
         setBusy(true);
-        ws.send(JSON.stringify({ kind: "resume", value: resume }));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ kind: "resume", value: resume }));
+        }
       };
     });
   });
 }
 
-function connect() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws/${threadId}`);
-  ws.onopen = () => append("system", "已连接 · 会话 " + threadId);
-  ws.onclose = () => { append("system", "连接断开，重连中..."); setTimeout(connect, 2000); };
-  ws.onmessage = (evt) => {
-    const d = JSON.parse(evt.data);
-    if (d.type === "user") append("user", d.content);
-    else if (d.type === "update") append(d.message.role, d.message.content, d.message.tool_calls);
-    else if (d.type === "interrupt") showInterrupt(d.payload);
-    else if (d.type === "done") setBusy(false);
-    else if (d.type === "error") { append("error", d.content); setBusy(false); }
-  };
-}
-
+/* ============================================================
+ * 发送消息
+ * ============================================================ */
 form.onsubmit = (e) => {
   e.preventDefault();
   const text = input.value.trim();
@@ -143,7 +626,23 @@ form.onsubmit = (e) => {
   ws.send(JSON.stringify({ kind: "message", text }));
 };
 
-connect();
+/* ============================================================
+ * 启动
+ * ============================================================ */
+(async function bootstrap() {
+  setAuthMode("login");
+  if (token) {
+    try {
+      currentUser = await api("/api/me");
+      await enterApp();
+      return;
+    } catch (e) {
+      token = "";
+      localStorage.removeItem("token");
+    }
+  }
+  authEl.style.display = "flex";
+})();
 </script>
 </body>
 </html>
