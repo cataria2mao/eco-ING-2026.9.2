@@ -29,7 +29,7 @@ if __name__ == "__main__":
     _force_selector_loop_on_windows()
 
     import uvicorn
-    from web_server import app
+    from server.web_server import app
 
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8000"))
