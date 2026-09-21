@@ -23,19 +23,12 @@ chroma_species_db/
 *.tmp
 history_checkpoints.txt
 agent3.2.py
-agent3.3.py
-agent3.4.py
-agent3.1.py
-agent_3.0.py
-agent_main.py
-agent_main2.0.py
-jiqiren.py
 测试.py
 langgraph.json
 ces1.py
 ces2.py
 
-# ===== 业务数据（请勿开源）=====
+# ===== 业务数据=====
 skills/参考名录.xlsx
 *.xlsx
 *.RData
