@@ -1,8 +1,10 @@
 # EcoAgent · 生态环境调查数据分析智能体
 
-基于 [LangGraph](https://github.com/langchain-ai/langgraph) 的多智能体（多图）系统，面向陆生动物 / 陆生植物调查与生态环境评估场景（样线法调查、历史资料整理、物种名录生成、多样性分析、报告撰写等），自动完成：
+基于 [LangGraph](https://github.com/langchain-ai/langgraph) 的多智能体（多图）系统，面向陆生动物 / 陆生植物调查与生态环境评估场景（样线法调查、物种名录生成、多样性分析、报告撰写等），支持RAG，短、长期记忆，人机协同，工具调用：
 
 > **需求判断 →  任务路由  →混合检索or（领域子图规划 → 脚本执行（Python/R）） → 结果汇报**
+> <img width="1912" height="948" alt="image" src="https://github.com/user-attachments/assets/c1c77b23-5550-475e-b1cd-b4c32c40e028" />
+
 
 核心设计思想（agent3.5）：
 
@@ -196,15 +198,14 @@ DASHSCOPE_API_KEY=sk-xxxx
 ### 5. 运行
 
 ```bash
-python agent3.5.py
+python run_server.py
 ```
 
-进入交互式命令行后输入任务即可，例如：
+进入交互式命令行后，点击[SERVER] http://127.0.0.1:8000 进入网页端注册登录即可，例如：
+
+<img width="844" height="562" alt="image" src="https://github.com/user-attachments/assets/77c505a3-39ed-4ec4-9a59-c01e2a613a2d" />
 
 ```
-🧑 你: 动物分析，报告撰写全工作流, 工作路径：D:\EcoAgentProject\广西风电鸟类监测，样线表文件：广西风电样线表.xlsx, 历史资料：广西风电动物历史资料.xlsx，pa：ⅤA，省级保护级别：广西自治区级
-```
-
 ---
 
 ## 📖 使用示例
@@ -243,19 +244,9 @@ parent_chat        → 向用户汇报结果
 ### 示例 2：知识问答（直接回答，不执行分析）
 
 **输入**
-
 ```
-鹈鹕的生活习性是什么
+<img width="1889" height="938" alt="image" src="https://github.com/user-attachments/assets/4299558d-64ad-47c7-8086-9b8f546366aa" />
 ```
-
-**流程**
-
-```
-parent_retrieve → 混合检索到 SOP 中的鹈鹕资料
-parent_router   → route=chat（一般问答，即使提到动物名也归 chat）
-parent_chat     → 结合检索资料直接回答
-```
-
 ### 示例 3：植物任务（路由到植物子图）
 
 **输入**
