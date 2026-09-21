@@ -9,9 +9,9 @@
 ## 后端
 <img width="1841" height="344" alt="image" src="https://github.com/user-attachments/assets/e31303af-8455-4c03-938c-84be624aad27" />
 
+---
 
-
-核心设计思想：
+## 核心设计思想：
 
 - **父图（协调+RAG）**：【需求判断】（动物任务 / 植物任务 / 知识问答）→ 数据分析/报告任务：将任务转发给对应子图 → 接收子图结果汇报。or
 → 知识问答（RAG）：从多个向量知识库中选择最匹配的一个做混合检索（DashScope 语义 + BM25）→ RRF融合 → Cross-Encoder精排→ 基于检索资料简述回答。
