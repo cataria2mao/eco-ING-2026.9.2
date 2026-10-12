@@ -5,8 +5,18 @@
 """
 
 import argparse
+import sys
 from pathlib import Path
 import pandas as pd
+
+
+def _setup_stdout_encoding() -> None:
+    """确保标准输出使用 UTF-8，避免 Windows GBK 控制台无法输出表情符号而崩溃。"""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        # 旧版本 Python 或已被重定向且不支持 reconfigure 时，忽略即可
+        pass
 
 
 def merge_animal_list(work_dir: str, sample_file: str, history_file: str, output_file: str) -> str:
@@ -96,6 +106,8 @@ def main():
     parser.add_argument("--output_file", default="动物列表.xlsx", help="输出文件名（如：动物列表.xlsx）")
 
     args = parser.parse_args()
+
+    _setup_stdout_encoding()
 
     result = merge_animal_list(
         work_dir=args.work_dir,

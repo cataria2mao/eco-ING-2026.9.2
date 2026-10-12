@@ -192,7 +192,12 @@ def run_python(script_path: str, script_args: str) -> str:
             return f"错误：脚本 {script_path} 不存在"
         sa_list = script_args.split() if script_args.strip() else []
         cmd = [sys.executable, script_path] + sa_list
-        result = sp.run(cmd, capture_output=True, text=True, encoding='utf-8', timeout=120)
+        # 强制子进程以 UTF-8 输出，避免中文 Windows 下子进程用 GBK 输出、
+        # 父进程按 UTF-8 解码时报 UnicodeDecodeError
+        child_env = os.environ.copy()
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        result = sp.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                        errors='replace', env=child_env, timeout=120)
         if result.returncode != 0:
             return f"执行失败 (code {result.returncode}):\nSTDERR:\n{result.stderr}\nSTDOUT:\n{result.stdout}"
         return result.stdout
@@ -253,16 +258,58 @@ def detect_step_type(step: Dict) -> str:
 
 
 def parse_review_action(response: Dict) -> str:
-    """解析 review 响应为统一 action"""
+    """解析 review 响应为统一 action（continue / retry / abort）。"""
+    if not isinstance(response, dict):
+        return "abort"
     if response.get("approved") is True:
         return "continue"
-    action = response.get("action", "")
-    if action in ("continue", "通过", "approve"):
+    action = str(response.get("action", "") or "").strip()
+    low = action.lower()
+    if action in ("continue", "通过", "确认", "approve") or low == "continue":
         return "continue"
-    elif action in ("retry", "重新执行", "修改", "retry_previous"):
+    if (low.startswith("retry") or action in ("修改", "retry_previous")
+            or any(k in action for k in ("重新执行", "重试"))):
         return "retry"
-    else:
+    if action in ("abort", "终止", "停止", "结束", "stop"):
         return "abort"
+    return "abort"
+
+
+def extract_retry_target_step(response: Dict) -> Optional[int]:
+    """从人工审核响应中解析用户指定要重新执行的步骤号（workflow 中的 step 编号）。
+
+    优先读取 target_step / target_idx / step / retry_step 等字段；
+    若没有结构化字段，则尝试从 feedback / action 文本中解析
+    形如 "retry 2"、"从第 2 步重新执行" 的表述。
+    未指定时返回 None（表示沿用默认行为）。
+    """
+    if not isinstance(response, dict):
+        return None
+    for key in ("target_step", "target_idx", "step", "retry_step", "target"):
+        val = response.get(key)
+        if val in (None, ""):
+            continue
+        m = re.search(r'\d+', str(val))
+        if m:
+            return int(m.group(0))
+    for key in ("feedback", "message", "action", "text"):
+        val = response.get(key)
+        if isinstance(val, str):
+            m = re.search(r'(?:retry|重新执行|重试|从)\D{0,6}?(\d+)', val)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def find_step_idx_by_num(steps: List[Dict], step_num: int) -> Optional[int]:
+    """按 workflow 中的步骤号（step 字段）查找其下标（index），找不到返回 None。"""
+    for i, s in enumerate(steps):
+        try:
+            if int(s.get("step")) == int(step_num):
+                return i
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def extract_output_files(results: List[Dict], params: Dict) -> List[str]:
@@ -588,6 +635,7 @@ def build_base_work_agent(
                 "current_step_idx": 0,
                 "step_outputs": {},
                 "retry_count": {},
+                "retry_target_idx": None,
                 "review_action": None,
                 "review_feedback": None,
                 "approved": None,
@@ -727,6 +775,28 @@ def build_base_work_agent(
                         "description": cfg.get("description", "")
                     })
         return next_steps
+
+    def collect_retryable_steps(state, step_idx: int) -> List[Dict]:
+        """收集审核步骤之前、已执行的技能步骤，供人工选择从哪一步重新执行。
+
+        step_idx 为排他上界（例如审核步骤的下标），范围 [0, step_idx)。
+        """
+        steps = state["workflow_steps"]
+        out = []
+        for i in range(min(step_idx, len(steps))):
+            s = steps[i]
+            if detect_step_type(s) != "skill":
+                continue
+            key = f"step_{s['step']}"
+            executed = key in state["step_outputs"]
+            out.append({
+                "step_num": s["step"],
+                "step_index": i,
+                "skill_id": s.get("use_skill"),
+                "skill_name": s.get("description") or s.get("use_skill"),
+                "status": "已完成" if executed else "未执行",
+            })
+        return out
 
     def build_params(state, step: Dict, target_config: Dict) -> Dict:
         params = {
@@ -888,6 +958,7 @@ def build_base_work_agent(
     def execute_review(state, step: Dict, step_idx: int) -> Dict:
         prev_output = find_previous_skill_output(state, step_idx)
         next_steps = find_next_skill_steps(state, step_idx)
+        retryable_steps = collect_retryable_steps(state, step_idx)
 
         step_num = step['step']
         step_desc = step.get("description", "未命名步骤")
@@ -931,13 +1002,23 @@ def build_base_work_agent(
         else:
             lines.append("  （无后续步骤）")
 
+        if retryable_steps:
+            lines.extend(["", "-" * 50, "🔁 可从以下已执行步骤选择重新执行起点:", "-" * 50])
+            for rs in retryable_steps:
+                lines.append(
+                    f"  步骤 {rs['step_num']}: "
+                    f"{rs.get('skill_name') or rs.get('skill_id') or '未描述'}"
+                    f"（状态: {rs.get('status', 'unknown')}）"
+                )
+
         lines.extend([
             "",
             "=" * 50,
             "⚡ 可执行操作（请回复对应指令）:",
             "=" * 50,
             "  [通过 / continue / 确认]  → 确认结果正确，继续执行后续步骤",
-            "  [重新执行 / retry / 重试]  → 重新执行上一步骤",
+            "  [重新执行 / retry / 重试]  → 重新执行步骤（默认：上一步骤）",
+            "      可指定起点，例如「retry 1」表示从步骤 1 重新执行",
             "  [终止 / stop / 结束]      → 终止整个任务",
             "",
             "💬 附加反馈（可选）: 可在指令后补充说明原因或修改建议",
@@ -947,25 +1028,44 @@ def build_base_work_agent(
         review_text = "\n".join(lines)
 
         response = interrupt({
+            "type": "workflow_intermediate",
             "review_type": "workflow_intermediate",
             "review_id": f"review_{step_num}",
             "domain": domain,
             "title": f"审核步骤 {step_num}: {step_desc}",
             "workflow_name": workflow_name,
             "content_text": review_text,
+            "retryable_steps": retryable_steps,
             "content_structured": {
                 "previous_step": prev_output,
                 "next_steps_preview": next_steps,
+                "retryable_steps": retryable_steps,
                 "retry_count": retry_count
             }
         })
 
+        if not isinstance(response, dict):
+            response = {}
+
         action = parse_review_action(response)
+
+        # 人工若指定了重新执行起点，解析为 workflow 下标；非法/越界则回退为默认（上一步骤）
+        retry_target_idx = None
+        if action == "retry":
+            target_step = extract_retry_target_step(response)
+            if target_step is not None:
+                cand = find_step_idx_by_num(state["workflow_steps"], target_step)
+                if (cand is not None and cand < step_idx
+                        and detect_step_type(state["workflow_steps"][cand]) == "skill"):
+                    retry_target_idx = cand
+                else:
+                    print(f"[DEBUG] execute_review({domain}): 指定的重试起点 {target_step} 非法，回退默认")
 
         return {
             "approved": action == "continue",
             "review_feedback": response.get("feedback", ""),
             "review_action": action,
+            "retry_target_idx": retry_target_idx,
             "review_text": review_text,
             "step_outputs": {
                 **state["step_outputs"],
@@ -1001,28 +1101,44 @@ def build_base_work_agent(
 
         if status == "error":
             error_msg = result.get("error", "未知错误")
-            step_num = state["workflow_steps"][state["current_step_idx"]]["step"]
+            cur_idx = state["current_step_idx"]
+            step_num = state["workflow_steps"][cur_idx]["step"]
+            retryable_steps = collect_retryable_steps(state, cur_idx + 1)
             interrupt_request = {
                 "type": "execution_error",
                 "domain": domain,
                 "step_num": step_num,
                 "error": error_msg,
                 "actions": {
-                    "retry": "重新执行当前步骤（使用相同参数）",
+                    "retry": "重新执行（默认当前失败步骤，可指定更早的步骤作为起点）",
                     "abort": "终止任务"
-                }
+                },
+                "retryable_steps": retryable_steps
             }
             # 暂停图，等待人工审核决定
             user_choice = interrupt(interrupt_request)
+            if not isinstance(user_choice, dict):
+                user_choice = {}
             action = user_choice.get("action")
 
             if action == "retry":
-                step_key = f"step_{step_num}"
+                # 默认重试当前失败步骤；若人工指定了 target_step，则从该步开始重跑
+                target_step = extract_retry_target_step(user_choice)
+                target_idx = cur_idx
+                if target_step is not None:
+                    cand = find_step_idx_by_num(state["workflow_steps"], target_step)
+                    if (cand is not None and cand <= cur_idx
+                            and detect_step_type(state["workflow_steps"][cand]) == "skill"):
+                        target_idx = cand
+                    else:
+                        print(f"[DEBUG] step_executor({domain}): 指定的重试起点 {target_step} 非法，回退当前步骤")
                 cleaned_outputs = dict(state["step_outputs"])
-                cleaned_outputs.pop(step_key, None)
+                for i in range(target_idx, len(state["workflow_steps"])):
+                    cleaned_outputs.pop(f"step_{state['workflow_steps'][i]['step']}", None)
                 return {
                     "step_outputs": cleaned_outputs,
-                    "current_step_idx": state["current_step_idx"],
+                    "current_step_idx": target_idx,
+                    "retry_target_idx": target_idx,
                     "error": None,
                     "status": "retry_current",
                     "review_action": None,
@@ -1139,15 +1255,22 @@ def build_base_work_agent(
         }
 
     def retry_node(state):
-        """单节点重试：清除目标技能步骤及其后续输出，回到该步骤重新执行。"""
-        target_idx = find_previous_skill_idx(state)
+        """重试：清除目标技能步骤及其后续输出，回到该步骤重新执行。
+
+        若人工在审核时指定了 retry_target_idx（从哪一步开始重跑），则从该步开始；
+        否则默认回退到上一个技能步骤。
+        """
+        steps = state["workflow_steps"]
+        target_idx = state.get("retry_target_idx")
+        if (target_idx is None or not (0 <= target_idx < len(steps))
+                or detect_step_type(steps[target_idx]) != "skill"):
+            target_idx = find_previous_skill_idx(state)
         if target_idx is None:
             return {
                 "review_action": "abort",
                 "review_feedback": state.get("review_feedback") or "重试失败：未找到可重试的技能步骤",
                 "approved": None,
             }
-        steps = state["workflow_steps"]
         cleaned_outputs = dict(state["step_outputs"])
         for i in range(target_idx, len(steps)):
             step_key = f"step_{steps[i]['step']}"

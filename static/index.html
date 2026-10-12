@@ -555,6 +555,12 @@ function setBusy(busy) {
 /* ============================================================
  * 人工确认面板
  * ============================================================ */
+function escapeHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 function showInterrupt(payloads) {
   interruptPanel.style.display = "block";
   interruptPanel.innerHTML = "";
@@ -574,12 +580,32 @@ function showInterrupt(payloads) {
       html += `<button id="ip-provide">提供参数</button>
                <button id="ip-default">使用默认参数</button>`;
     } else if (type === "execution_error") {
-      html += `<div>错误：${p.error || ""}</div>`;
+      const retryable = p.retryable_steps || [];
+      html += `<div>错误：${escapeHtml(p.error || "")}</div>`;
+      if (retryable.length) {
+        html += `<div style="margin:6px 0">选择重新执行起点：
+          <select id="ip-target-step">
+            <option value="">默认（当前失败步骤）</option>
+            ${retryable.map(s => `<option value="${escapeHtml(s.step_num)}">步骤 ${escapeHtml(s.step_num)}：${escapeHtml(s.skill_name || s.skill_id || "")}</option>`).join("")}
+          </select></div>`;
+      }
       html += `<input id="ip-feedback" placeholder="修改建议（可选）" style="width:60%"/>
                <button id="ip-retry">重试</button>
                <button id="ip-abort">终止</button>`;
     } else {
-      html += `<pre style="font-size:12px;max-height:200px;overflow:auto">${JSON.stringify(p, null, 2)}</pre>
+      // 工作流审核（workflow_intermediate）
+      const retryable = p.retryable_steps
+        || (p.content_structured && p.content_structured.retryable_steps) || [];
+      const content = p.content_text || JSON.stringify(p, null, 2);
+      html += `<pre style="font-size:12px;max-height:240px;overflow:auto;white-space:pre-wrap">${escapeHtml(content)}</pre>`;
+      if (retryable.length) {
+        html += `<div style="margin:6px 0">选择重新执行起点：
+          <select id="ip-target-step">
+            <option value="">默认（上一步骤）</option>
+            ${retryable.map(s => `<option value="${escapeHtml(s.step_num)}">步骤 ${escapeHtml(s.step_num)}：${escapeHtml(s.skill_name || s.skill_id || "")}</option>`).join("")}
+          </select></div>`;
+      }
+      html += `<input id="ip-feedback" placeholder="修改建议（可选）" style="width:60%"/>
                <button id="ip-approve">通过</button>
                <button id="ip-retry">重新执行</button>
                <button id="ip-abort">终止</button>`;
@@ -602,7 +628,9 @@ function showInterrupt(payloads) {
           resume = { approved: true, action: "continue" };
         } else if (btn.id === "ip-retry") {
           const fb = box.querySelector("#ip-feedback");
+          const sel = box.querySelector("#ip-target-step");
           resume = { approved: false, action: "retry", feedback: fb ? fb.value : "" };
+          if (sel && sel.value) resume.target_step = Number(sel.value);
         } else if (btn.id === "ip-abort") {
           resume = { approved: false, action: "abort" };
         }

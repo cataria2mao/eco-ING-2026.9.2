@@ -211,7 +211,6 @@ KNOWLEDGE_BASES: Dict[str, Dict[str, Any]] = {
         "collection": "sop_semantic",
         "chunks_file": "sop_chunks.json",
     },
-
      "species": {
          "label": "物种知识库",
          "description": "陆生动物/植物物种名录、保护级别、居留型、生活习性等",
@@ -398,7 +397,7 @@ _RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") == "1"
 # 精排归一化分数阈值。低于该值视为“知识库无匹配内容”。
 # 经验值：bge-reranker-v2-m3 normalize=True 后 0.25~0.35 之间可作分水岭；
 # 0 表示关闭阈值。
-_RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.3"))
+_RERANK_MIN_SCORE = float(os.getenv("RERANK_MIN_SCORE", "0.35"))
 
 # 精排不可用时用 BM25 最高分兜底过滤（BM25 无上界，只能拿经验值）
 _BM25_MIN_SCORE = float(os.getenv("BM25_MIN_SCORE", "0.0"))  # 0 表示不启用兜底
@@ -922,6 +921,12 @@ async def _print_last_ai_message(agent, config):
             return
 
 
+def _cli_target_step(text: str) -> Optional[int]:
+    """从 CLI 输入中解析用户选择的步骤号（如 "2"、"步骤 2"、"retry 2"）。"""
+    m = re.search(r'\d+', text or "")
+    return int(m.group(0)) if m else None
+
+
 async def _handle_interrupts(agent, config):
     """检查并处理图中的 interrupt 状态（人工审核/失败中断）"""
     state = await agent.aget_state(config)
@@ -959,11 +964,23 @@ async def _handle_interrupts(agent, config):
                         print("无效输入，请输入: 提供参数 或 默认参数")
             elif interrupt_value.get("type") == "execution_error":
                 print(f"错误详情: {interrupt_value.get('error')}")
+                retryable = interrupt_value.get("retryable_steps") or []
+                if retryable:
+                    print("可从以下已执行步骤选择重新执行起点：")
+                    for rs in retryable:
+                        print(f"  步骤 {rs.get('step_num')}: {rs.get('skill_name') or rs.get('skill_id') or ''}")
                 while True:
                     choice = (await asyncio.to_thread(input, "请选择 (重试/终止): ")).strip().lower()
-                    if choice in ("重试", "retry"):
+                    if choice in ("重试", "retry") or choice.startswith("retry"):
                         feedback = (await asyncio.to_thread(input, "请输入修改建议（可选）: ")).strip()
                         resume_value = {"approved": False, "action": "retry", "feedback": feedback}
+                        target = _cli_target_step(choice)
+                        if target is None and retryable:
+                            sel = (await asyncio.to_thread(
+                                input, "请选择从哪一步重新执行（直接回车=默认当前失败步骤）: ")).strip()
+                            target = _cli_target_step(sel)
+                        if target is not None:
+                            resume_value["target_step"] = target
                         break
                     elif choice in ("终止", "abort"):
                         resume_value = {"approved": False, "action": "abort"}
@@ -971,14 +988,26 @@ async def _handle_interrupts(agent, config):
                     else:
                         print("无效输入，请输入: 重试 或 终止")
             else:
+                retryable = interrupt_value.get("retryable_steps") or []
+                if retryable:
+                    print("可从以下已执行步骤选择重新执行起点：")
+                    for rs in retryable:
+                        print(f"  步骤 {rs.get('step_num')}: {rs.get('skill_name') or rs.get('skill_id') or ''}")
                 while True:
                     action_input = (await asyncio.to_thread(input, "\n请选择操作 (通过/重新执行/终止): ")).strip()
                     if action_input in ("通过", "approve", "continue"):
                         resume_value = {"approved": True, "action": "continue"}
                         break
-                    elif action_input in ("重新执行", "retry"):
+                    elif action_input in ("重新执行", "retry") or action_input.startswith("retry"):
                         feedback = (await asyncio.to_thread(input, "请输入修改建议（可选）: ")).strip()
                         resume_value = {"approved": False, "action": "retry", "feedback": feedback}
+                        target = _cli_target_step(action_input)
+                        if target is None and retryable:
+                            sel = (await asyncio.to_thread(
+                                input, "请选择从哪一步重新执行（直接回车=默认上一步骤）: ")).strip()
+                            target = _cli_target_step(sel)
+                        if target is not None:
+                            resume_value["target_step"] = target
                         break
                     elif action_input in ("终止", "abort"):
                         resume_value = {"approved": False, "action": "abort"}
