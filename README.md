@@ -245,7 +245,12 @@ animal_base_work_agent.executor → 步骤1 ✅ 输出 动物列表.xlsx
 parent_report      → 汇总 animal_result
 parent_chat        → 向用户汇报结果
 ```
+```
+<img width="948" height="905" alt="f86d90a76a4b8a6aa4a26ba21b3e51a7" src="https://github.com/user-attachments/assets/e3b4ffa3-9426-4654-a043-063b52deed43" />
+<img width="894" height="905" alt="66bd168d178f7c18393b0a1b49b6bfd4" src="https://github.com/user-attachments/assets/d0f28f92-46dc-4fff-a684-79530394258d" />
 
+
+```
 ### 示例 2：知识问答（直接回答，不执行分析）
 
 **输入**
