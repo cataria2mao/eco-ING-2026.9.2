@@ -445,9 +445,9 @@ def create_mammal_table(doc, df_group):
 def main():
     parser = argparse.ArgumentParser(description='利用动物名录的excel表格生成word版')
     # 输入输出文件参数
-    parser.add_argument('--work_dir', default='E:/小金河盐源流域综合规划',
+    parser.add_argument('--work_dir', default='D:/EcoAgentProject/广西风电鸟类监测',
                         help='工作文件路径')
-    parser.add_argument('--input_file', default='xjh动物名录.xlsx',
+    parser.add_argument('--input_file', default='动物名录.xlsx',
                         help='动物名录的excel表格')
     parser.add_argument('--output_file', default='动物名录.docx',
                         help='动物名录word版')
@@ -517,7 +517,7 @@ def main():
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     doc.save(output_path)
-    print(f"横向文档已成功生成：{output_path}")
+    print(f"{output_path}")
 
 if __name__ == '__main__':
     main()

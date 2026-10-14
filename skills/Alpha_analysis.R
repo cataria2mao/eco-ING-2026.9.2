@@ -137,7 +137,7 @@ if (groups_type == "季节") {
     mutate(优势度 = sprintf("%.2f%%", nums/sum(nums)*100))
   
   dyxD <- data.frame(matrix(0, 1, 5))
-  dyxD[1, 1] <- "niaolei"
+  dyxD[1, 1] <- "鸟纲"
   colnames(dyxD) <- c('多样性指数', 'Simpson.D', 'Shannon.H','Pielou.E','DM')
   
   dyxD$Simpson.D <- diversity(df$nums, index = "simpson")

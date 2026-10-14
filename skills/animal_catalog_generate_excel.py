@@ -56,7 +56,6 @@ def main():
 
     args = parser.parse_args()
     regional_level = [args.regional_level]
-    print(regional_level)
     work_dir = Path(args.work_dir).resolve()  # resolve() 会统一格式并转为绝对路径
     input_folder = work_dir / args.input_file
     output_folder = work_dir / args.output_file
@@ -164,8 +163,9 @@ def main():
         text = replace_region_stats(text)
         df_all.loc[idx, '区系类型'] = text
 
+    df_sorted = df_all.sort_values(by='序号', ascending=True)
     # 保存结果
-    df_all.to_excel(output_folder, sheet_name="Sheet1", index=False, na_rep='')
+    df_sorted.to_excel(output_folder, sheet_name="Sheet1", index=False, na_rep='')
 
     print(f"{output_folder}")
 
