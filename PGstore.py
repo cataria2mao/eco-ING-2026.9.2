@@ -4,11 +4,11 @@ from sqlalchemy import create_engine
 # --- 1. 配置数据库连接 ---
 # 数据库连接字符串格式: postgresql://用户名:密码@主机:端口/数据库名
 # 请将下面的 'your_username', 'your_password', 'your_database' 替换为你的实际信息
-DB_USER = 'postgres'
-DB_PASSWORD = '010405yx'  # 替换为你的密码
+DB_USER = 'your_username'
+DB_PASSWORD = 'your_password'  # 替换为你的密码
 DB_HOST = 'localhost'
 DB_PORT = '5432'
-DB_NAME = 'animal_base_data'   # 你要导入的目标数据库
+DB_NAME = 'your_database'   # 你要导入的目标数据库
 
 # 创建数据库引擎
 engine = create_engine(f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}')
