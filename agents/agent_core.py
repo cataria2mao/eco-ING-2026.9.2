@@ -194,8 +194,6 @@ async def init_agent():
 # 父图：需求判断→ 分发子图 或 检索知识库 → 结果汇报
 # ============================================================
 
-SOP_DOCX_PATH = os.getenv("SOP_DOCX_PATH", r"D:\PythonProject1\生态环境调查报告工作sop.docx")
-CHROMA_DIR = os.getenv("CHROMA_DIR", str(Path(__file__).resolve().parent / "chroma_sop_db"))
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v3")
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 EMBED_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
@@ -207,7 +205,7 @@ KNOWLEDGE_BASES: Dict[str, Dict[str, Any]] = {
     "sop": {
         "label": "生态环境调查 SOP",
         "description": "生态环境调查工作方案、调查流程、报告撰写规范等",
-        "chroma_dir": CHROMA_DIR,
+        "chroma_dir": str(Path(__file__).resolve().parent / "chroma_sop_db"),
         "collection": "sop_semantic",
         "chunks_file": "sop_chunks.json",
     },

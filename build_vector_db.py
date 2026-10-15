@@ -13,7 +13,7 @@ CHROMA_DIR = os.getenv("CHROMA_DIR", str(Path(__file__).resolve().parent / "chro
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v4")
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 EMBED_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-COLLECTION_NAME = "species_semantic"   #
+COLLECTION_NAME = "species_semantic"   #集合名称，在同一向量数据库中新增不同的集合时修改
 
 
 class DashScopeEmbeddingFunction:
