@@ -99,6 +99,22 @@ async def _collect_interrupts(config):
     return out
 
 
+async def _finish_turn(ws: WebSocket, db: Session, conv: Conversation, config) -> None:
+    """一轮执行结束：若有挂起的 interrupt 则推送确认面板，否则结束。
+
+    同时把"触发人工审核"这一中间状态落库，这样即便稍后审核被处理，
+    切换回该会话时仍能在历史流中看到该步骤。
+    """
+    pending = await _collect_interrupts(config)
+    if pending:
+        # 先落库并实时推送"触发人工审核"这一中间状态，
+        # 保证实时流与断线重连后的回放表现一致。
+        await _push_event(ws, db, conv.id, {"type": "interrupt_record", "payload": pending})
+        await ws.send_json({"type": "interrupt", "payload": pending})
+    else:
+        await ws.send_json({"type": "done"})
+
+
 # ============================================================
 # 数据库写入辅助
 # ============================================================
@@ -117,6 +133,33 @@ def _save_message(db: Session, conversation_id: int, message_id: Optional[str], 
         db.commit()
     except IntegrityError:
         db.rollback()   # 已存在，忽略
+
+
+def _save_event(db: Session, conversation_id: int, event: dict) -> None:
+    """把节点级中间状态（需求判断 / 检索 / 任务分发 / 检索阶段）持久化。
+
+    复用 messages 表：role 固定为 "event"，content 存放事件 JSON。
+    因为与普通消息共用自增主键 id，事件与消息天然按发生顺序交错，
+    回放时按 id 升序即可还原完整的执行过程。
+    """
+    try:
+        db.add(Message(
+            conversation_id=conversation_id,
+            message_id="event-" + uuid.uuid4().hex,
+            role="event",
+            content=json.dumps(event, ensure_ascii=False),
+            tool_calls=None,
+        ))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+
+
+async def _push_event(ws: WebSocket, db: Optional[Session], conversation_id: Optional[int], event: dict) -> None:
+    """先落库（保证切换会话后可回放），再实时推送给前端。"""
+    if db is not None and conversation_id is not None:
+        _save_event(db, conversation_id, event)
+    await ws.send_json(event)
 
 
 def _touch_conversation(db: Session, conv: Conversation, user_text: Optional[str] = None) -> None:
@@ -216,7 +259,9 @@ def create_conversation(user: User = Depends(get_current_user), db: Session = De
 def conversation_messages(cid: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     conv = _get_owned_conversation(db, user, cid)
     rows = db.execute(
-        select(Message).where(Message.conversation_id == conv.id).order_by(Message.id.asc())
+        select(Message)
+        .where(Message.conversation_id == conv.id, Message.role != "event")
+        .order_by(Message.id.asc())
     ).scalars().all()
     return [_msg_out(m) for m in rows]
 
@@ -242,8 +287,9 @@ def delete_conversation(cid: int, user: User = Depends(get_current_user), db: Se
 # ============================================================
 # 节点级事件推送
 # ============================================================
-async def _emit_node_event(node: str, update, ctx: dict, ws: WebSocket):
-    """把关键节点的执行信息（需求判断 / 知识库检索 / 任务分发）推送给前端。"""
+async def _emit_node_event(node: str, update, ctx: dict, ws: WebSocket,
+                           db: Optional[Session] = None, conversation_id: Optional[int] = None):
+    """把关键节点的执行信息（需求判断 / 知识库检索 / 任务分发）落库并推送给前端。"""
     if not isinstance(update, dict):
         return
     try:
@@ -251,7 +297,7 @@ async def _emit_node_event(node: str, update, ctx: dict, ws: WebSocket):
         if node == "parent_router":
             route = update.get("route")
             if route in ("animal", "plant"):
-                await ws.send_json({
+                await _push_event(ws, db, conversation_id, {
                     "type": "route",
                     "route": route,
                     "kb": update.get("kb") or "none",
@@ -263,7 +309,7 @@ async def _emit_node_event(node: str, update, ctx: dict, ws: WebSocket):
             kb = ctx.get("kb") or "none"
             cfg = KNOWLEDGE_BASES.get(kb) or {}
             docs = update.get("retrieved_docs") or []
-            await ws.send_json({
+            await _push_event(ws, db, conversation_id, {
                 "type": "retrieve",
                 "kb": kb,
                 "label": cfg.get("label", kb),
@@ -280,7 +326,7 @@ async def _emit_node_event(node: str, update, ctx: dict, ws: WebSocket):
                 domain, agent, label, task = "plant", "plant_base_work_agent", "陆生植物", req_plant
             else:
                 return
-            await ws.send_json({
+            await _push_event(ws, db, conversation_id, {
                 "type": "dispatch",
                 "domain": domain,
                 "agent": agent,
@@ -325,14 +371,14 @@ async def _stream_and_forward(payload, config, ws, sent_ids, db, conversation_id
 
         elif mode == "updates":
             for node, update in (chunk or {}).items():
-                await _emit_node_event(node, update, ctx, ws)
+                await _emit_node_event(node, update, ctx, ws, db, conversation_id)
 
         elif mode == "custom":
             # 节点内部通过 get_stream_writer() 主动推送的阶段事件
             if not isinstance(chunk, dict):
                 continue
             if chunk.get("__retrieve_stage__"):
-                await ws.send_json({
+                await _push_event(ws, db, conversation_id, {
                     "type": "retrieve_stage",
                     "kb": chunk.get("kb") or "none",
                     "label": chunk.get("label") or "",
@@ -367,14 +413,24 @@ async def ws_chat(ws: WebSocket, thread_id: str, token: str = Query("")):
     config = {"configurable": {"thread_id": thread_id}}
     sent_ids: set = set()
 
-    # 断线重连 / 切换会话时，从数据库回放历史消息
+    # 断线重连 / 切换会话时，从数据库回放历史消息与中间状态事件
     try:
+        await ws.send_json({"type": "replay_start"})
         history = db.execute(
             select(Message).where(Message.conversation_id == conv.id).order_by(Message.id.asc())
         ).scalars().all()
         for m in history:
             sent_ids.add(m.message_id)
-            if m.role == "user":
+            if m.role == "event":
+                # 回放持久化的节点级中间状态（需求判断 / 检索 / 分发 / 检索阶段）
+                try:
+                    event = json.loads(m.content) if m.content else None
+                except Exception:
+                    event = None
+                if isinstance(event, dict) and event.get("type"):
+                    event["replay"] = True
+                    await ws.send_json(event)
+            elif m.role == "user":
                 await ws.send_json({"type": "user", "content": m.content})
             else:
                 await ws.send_json({"type": "update", "message": _msg_out(m), "replay": True})
@@ -382,6 +438,7 @@ async def ws_chat(ws: WebSocket, thread_id: str, token: str = Query("")):
         pending = await _collect_interrupts(config)
         if pending:
             await ws.send_json({"type": "interrupt", "payload": pending})
+        await ws.send_json({"type": "replay_end"})
     except Exception:
         pass
 
@@ -410,17 +467,28 @@ async def ws_chat(ws: WebSocket, thread_id: str, token: str = Query("")):
                     continue
 
                 _touch_conversation(db, conv)
-
-                pending = await _collect_interrupts(config)
-                if pending:
-                    await ws.send_json({"type": "interrupt", "payload": pending})
-                else:
-                    await ws.send_json({"type": "done"})
+                await _finish_turn(ws, db, conv, config)
 
             elif kind == "resume":
+                resume_value = data.get("value") or {}
+                # 把"人工审核结果"也作为中间状态落库并推送，
+                # 这样审核完成后，历史聊天流里依旧能看到人类做出的处理动作。
+                try:
+                    pending_before = await _collect_interrupts(config)
+                except Exception:
+                    pending_before = []
+                first_type = None
+                for p in pending_before:
+                    if isinstance(p, dict) and p.get("type"):
+                        first_type = p["type"]
+                        break
+                await _push_event(ws, db, conv.id, {
+                    "type": "review_result",
+                    "payload": {"value": resume_value, "interrupt_type": first_type},
+                })
                 try:
                     await _stream_and_forward(
-                        Command(resume=data.get("value") or {}),
+                        Command(resume=resume_value),
                         config, ws, sent_ids, db, conv.id,
                     )
                 except Exception as e:
@@ -428,12 +496,7 @@ async def ws_chat(ws: WebSocket, thread_id: str, token: str = Query("")):
                     continue
 
                 _touch_conversation(db, conv)
-
-                pending = await _collect_interrupts(config)
-                if pending:
-                    await ws.send_json({"type": "interrupt", "payload": pending})
-                else:
-                    await ws.send_json({"type": "done"})
+                await _finish_turn(ws, db, conv, config)
 
     except WebSocketDisconnect:
         return

@@ -12,7 +12,7 @@
     {
       "tool": "run_r",
       "params": {
-        "script_path": "skills/animal_catalog_analysis.R",
+        "script_path": "animal_skills/animal_catalog_analysis.R",
         "script_args": [
           "--work_dir", "{work_dir}",
           "--input_file", "{input_file}",
