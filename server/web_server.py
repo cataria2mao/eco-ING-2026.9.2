@@ -15,9 +15,9 @@ from langgraph.types import Command, Interrupt
 
 from contextlib import asynccontextmanager
 
-import agent_core
-from agent_core import KNOWLEDGE_BASES, init_agent   # 模型 / 技能导入时初始化，图在 startup 构建
-from server.database import Conversation, Message, SessionLocal, User
+from agents import agent_core
+from agents.agent_core import KNOWLEDGE_BASES, init_agent   # 模型 / 技能导入时初始化，图在 startup 构建
+from server.database import Conversation, Message, User
 from server.auth import (
     authenticate_ws_token,
     create_token,
@@ -444,4 +444,4 @@ async def ws_chat(ws: WebSocket, thread_id: str, token: str = Query("")):
 # ---------- 静态页 ----------
 @app.get("/")
 async def index():
-    return HTMLResponse(Path("static/index.html").read_text(encoding="utf-8"))
+    return HTMLResponse(Path("static/gemini3777.html").read_text(encoding="utf-8"))

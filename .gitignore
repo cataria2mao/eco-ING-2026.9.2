@@ -29,7 +29,7 @@ ces1.py
 ces2.py
 
 # ===== 业务数据=====
-skills/参考名录.xlsx
+animal_skills/参考名录.xlsx
 *.xlsx
 *.RData
 *.Rhistory

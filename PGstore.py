@@ -15,7 +15,7 @@ engine = create_engine(f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT
 
 # --- 2. 读取 Excel 文件 ---
 # 请将 '参考文件.xlsx' 替换为你的文件实际路径
-excel_file_path = 'D:/PythonProject1/skills/参考名录.xlsx'
+excel_file_path = '/animal_skills/参考名录.xlsx'
 df = pd.read_excel(excel_file_path, engine='openpyxl')
 
 # (可选) 如果列名需要与数据库表字段匹配，可以在此处重命名
