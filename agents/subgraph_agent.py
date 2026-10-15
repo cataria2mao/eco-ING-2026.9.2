@@ -18,7 +18,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt
 
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 class AnimalAnalysisState(TypedDict):
     """动物子图 animal_base_work_agent 的状态（与父图状态分离）。"""

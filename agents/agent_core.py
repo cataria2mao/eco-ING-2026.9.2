@@ -50,7 +50,7 @@ class ParentState(TypedDict):
 load_dotenv(override=True)
 
 llm = ChatDeepSeek(
-    model="deepseek-v4-flash",
+    model="deepseek-flash",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_BASE_URL"),
     temperature=0,
@@ -194,30 +194,29 @@ async def init_agent():
 # 父图：需求判断→ 分发子图 或 检索知识库 → 结果汇报
 # ============================================================
 
-EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v3")
+# ========== 多知识库（多向量数据库）注册表 ==========
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-v4")
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 EMBED_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 
 
-# ========== 多知识库（多向量数据库）注册表 ==========
 # 每个知识库独立使用一个 chromadb 持久化目录 + collection，并缓存 chunks 供 BM25 使用。
 KNOWLEDGE_BASES: Dict[str, Dict[str, Any]] = {
     "sop": {
         "label": "生态环境调查 SOP",
         "description": "生态环境调查工作方案、调查流程、报告撰写规范等",
-        "chroma_dir": str(Path(__file__).resolve().parent / "chroma_sop_db"),
+        "chroma_dir": str(Path(__file__).resolve().parents[1] / "chroma_sop_db"),
         "collection": "sop_semantic",
         "chunks_file": "sop_chunks.json",
     },
      "species": {
          "label": "物种知识库",
          "description": "陆生动物/植物物种名录、保护级别、居留型、生活习性等",
-         "chroma_dir": str(Path(__file__).resolve().parent / "chroma_species_db"),
+         "chroma_dir": str(Path(__file__).resolve().parents[1] / "chroma_species_db"),
          "collection": "species_semantic",
          "chunks_file": "species_chunks.json",
      },
 }
-DEFAULT_KB = "sop"
 
 
 def _kb_catalog_text() -> str:
@@ -337,7 +336,7 @@ def _kb_config(kb: str) -> Optional[Dict[str, Any]]:
     return KNOWLEDGE_BASES.get(kb)
 
 
-def _load_chunks(kb: str = DEFAULT_KB) -> List[str]:
+def _load_chunks(kb: str) -> List[str]:
     """加载指定知识库的文本块（优先读缓存文件，否则从 chromadb 读取）。"""
     if kb in _kb_chunks_cache:
         return _kb_chunks_cache[kb]
@@ -345,7 +344,7 @@ def _load_chunks(kb: str = DEFAULT_KB) -> List[str]:
     if not cfg:
         print(f"[VEC] 未知知识库: {kb}")
         return []
-    chroma_dir = cfg.get("chroma_dir", CHROMA_DIR)
+    chroma_dir = cfg.get("chroma_dir")
     chunks: List[str] = []
     cache_file = Path(chroma_dir) / cfg.get("chunks_file", "chunks.json")
     if cache_file.exists():
@@ -365,7 +364,7 @@ def _load_chunks(kb: str = DEFAULT_KB) -> List[str]:
     return chunks
 
 
-def _get_retrievers(kb: str = DEFAULT_KB):
+def _get_retrievers(kb: str):
     """获取指定知识库的语义检索器与关键词检索器（惰性初始化，按知识库隔离）。"""
     chunks = _load_chunks(kb)
     cfg = _kb_config(kb) or {}
@@ -376,7 +375,7 @@ def _get_retrievers(kb: str = DEFAULT_KB):
     if kb not in _kb_semantic_store:
         try:
             import chromadb
-            client = chromadb.PersistentClient(path=cfg.get("chroma_dir", CHROMA_DIR))
+            client = chromadb.PersistentClient(path=cfg.get("chroma_dir"))
             _kb_semantic_store[kb] = client.get_collection(
                 name=cfg.get("collection", "sop_semantic"),
                 embedding_function=_DashScopeEmbeddingFunction(),
