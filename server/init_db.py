@@ -31,7 +31,6 @@ load_dotenv(override=True)
 
 PG_DSN = os.getenv(
     "PG_DSN",
-    "postgresql+psycopg://animal_agent:010405@localhost:5432/agent_platform",
 )
 PG_ADMIN_DSN = os.getenv("PG_ADMIN_DSN", "")
 

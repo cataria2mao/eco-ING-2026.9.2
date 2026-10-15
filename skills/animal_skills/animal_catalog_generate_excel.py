@@ -1,5 +1,8 @@
+import os
 import sys, argparse, re
 from pathlib import Path
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 import pandas as pd
 
@@ -76,14 +79,12 @@ def main():
 
     # ---------- 配置数据库连接 ----------
     # 使用之前创建的 animal_agent 用户
-    DB_USER = 'animal_agent'
-    DB_PASSWORD = '010405'  # 替换为实际密码
-    DB_HOST = 'localhost'  # 或 IP 地址
-    DB_PORT = '5432'
-    DB_NAME = 'animal_base_data'  # 目标数据库
+    load_dotenv(override=True)
+
+    PG_ANIMAL_BASE_DATA_DSN = os.getenv("PG_ANIMAL_BASE_DATA_DSN", "")
 
     # 创建 SQLAlchemy 引擎
-    engine = create_engine(f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}')
+    engine = create_engine(PG_ANIMAL_BASE_DATA_DSN)
 
     # ---------- 读取表数据 ----------
     table_name = 'terrestrial_vertebrates_basic_data'
