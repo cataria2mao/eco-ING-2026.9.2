@@ -15,7 +15,7 @@
       "step": 1,
       "tool": "run_python",
       "params": {
-        "script_path": "animal_skills/animal_catalog_generate_excel.py",
+        "script_path": "skills/animal_skills/animal_catalog_generate_excel.py",
         "script_args": [
           "--work_dir", "{work_dir}",
           "--input_file", "{input_file}",

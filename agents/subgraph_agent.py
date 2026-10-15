@@ -138,8 +138,8 @@ def _load_full_skill_from(registry: List[Dict], skill_name: str) -> tuple:
 
 # 动物技能放在 skills/ 根目录；植物技能放在 plant_skills/ 目录（各自独立发现）
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ANIMAL_SKILLS_ROOT = PROJECT_ROOT / "animal_skills"
-PLANT_SKILLS_ROOT = PROJECT_ROOT / "plant_skills"
+ANIMAL_SKILLS_ROOT = PROJECT_ROOT / "skills/animal_skills"
+PLANT_SKILLS_ROOT = PROJECT_ROOT / "skills/plant_skills"
 # ========== 共享工具（脚本执行 / 文件读取） ==========
 @tool
 def list_files(directory: str = ".") -> List[str]:
