@@ -444,4 +444,4 @@ async def ws_chat(ws: WebSocket, thread_id: str, token: str = Query("")):
 # ---------- 静态页 ----------
 @app.get("/")
 async def index():
-    return HTMLResponse(Path("static/gemini3777.html").read_text(encoding="utf-8"))
+    return HTMLResponse(Path("static/index.html").read_text(encoding="utf-8"))
