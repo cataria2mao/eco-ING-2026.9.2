@@ -4,7 +4,8 @@
 
 > **需求判断 →  任务路由  →混合检索or（领域子图规划 → 脚本执行（Python/R）） → 结果汇报**
 ## 前端
-<img width="1912" height="948" alt="image" src="https://github.com/user-attachments/assets/c1c77b23-5550-475e-b1cd-b4c32c40e028" />
+<img width="1912" height="948" alt="2c3c19bb8b7f062f9c5fb98b886828f2" src="https://github.com/user-attachments/assets/48828de7-4db8-42e5-8b8a-46a8f50b71cf" />
+
 
 ## 后端
 <img width="1841" height="344" alt="image" src="https://github.com/user-attachments/assets/e31303af-8455-4c03-938c-84be624aad27" />
@@ -251,11 +252,12 @@ parent_chat        → 向用户汇报结果
 
 
 ```
-### 示例 2：知识问答（直接回答，不执行分析）
+### 示例 2：知识问答（直接回答，不执行分析。知识库无相关资料时不胡编乱造）
 
 **输入**
 ```
-<img width="1889" height="938" alt="image" src="https://github.com/user-attachments/assets/4299558d-64ad-47c7-8086-9b8f546366aa" />
+<img width="1912" height="948" alt="2a483b6a6854a8958e6578ff165c9c84" src="https://github.com/user-attachments/assets/3751be40-53ad-4d87-b14f-79755f0aa7b3" />
+
 ```
 ### 示例 3：植物任务（路由到植物子图）
 
