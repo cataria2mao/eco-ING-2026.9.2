@@ -252,12 +252,11 @@ parent_chat        → 向用户汇报结果
 
 
 ```
-### 示例 2：知识问答（直接回答，不执行分析。知识库无相关资料时不胡编乱造）
+### 示例 2：知识问答（直接回答，不执行分析。知识库无相关资料时不胡编乱造。）
 
 **输入**
 ```
-<img width="1912" height="948" alt="2a483b6a6854a8958e6578ff165c9c84" src="https://github.com/user-attachments/assets/3751be40-53ad-4d87-b14f-79755f0aa7b3" />
-
+<img width="1912" height="948" alt="4ad133c28955df787c9feb1f4c3cf1a9" src="https://github.com/user-attachments/assets/6f6b679c-d229-4690-a3e2-dca4803a1c3e" />
 ```
 ### 示例 3：植物任务（路由到植物子图）
 
