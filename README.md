@@ -294,7 +294,7 @@ parent_report → 汇总 plant_result 汇报
 ### 模型
 
 - LLM 默认使用 DeepSeek 兼容接口（代码中为 `deepseek-v4-flash`，可在 `llm` / `parent_llm` 处修改为你的模型名）
-- 语义向量化默认使用 DashScope `text-embedding-v3`
+- 语义向量化默认使用 DashScope `text-embedding-v4`
 
 ---
 
@@ -302,8 +302,8 @@ parent_report → 汇总 plant_result 汇报
 
 ```
 .
-├── agent3.5.py                     # 主程序（父图 + 动物/植物两个领域子图）
-├── skills/                         # 动物技能目录（JSON 声明式配置 + 脚本）
+├── agents/agent_core.py                     # 主程序（父图 + 动物/植物两个领域子图）
+├── skills/animal_skills                    # 动物技能目录（JSON 声明式配置 + 脚本）
 │   ├── animal_simple_list.json     #   动物列表合并（Python）
 │   ├── animal_simple_list.py
 │   ├── animal_catalog_generate.json#   动物名录生成（Python）
