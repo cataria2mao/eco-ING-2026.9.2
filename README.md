@@ -302,8 +302,8 @@ parent_report → 汇总 plant_result 汇报
 
 ```
 .
-├── agents/agent_core.py                     # 主程序（父图 + 动物/植物两个领域子图）
-├── skills/animal_skills                    # 动物技能目录（JSON 声明式配置 + 脚本）
+├── agents/agent_core.py             # 主程序（父图 + 动物/植物两个领域子图）
+├── skills/animal_skills             # 动物技能目录（JSON 声明式配置 + 脚本）
 │   ├── animal_simple_list.json     #   动物列表合并（Python）
 │   ├── animal_simple_list.py
 │   ├── animal_catalog_generate.json#   动物名录生成（Python）
@@ -314,7 +314,7 @@ parent_report → 汇总 plant_result 汇报
 │   ├── Alpha_analysis.R
 │   ├── full_animal_workflow.json   #   全工作流编排
 │   └── 参考名录.xlsx               #   参考名录数据（示例数据，可用PostgreSQL数据库）
-├── plant_skills/                   # 植物技能目录（待创建/验证，规划器与执行器已就绪）
+├── skills/plant_skills             # 植物技能目录（待创建/验证，规划器与执行器已就绪）
 ├── chroma_sop_db/                  # Chroma 向量库（运行时生成）
 ├── requirements.txt                # Python 依赖
 ├── .env.example                    # 环境变量示例
